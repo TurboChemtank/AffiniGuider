@@ -3,6 +3,7 @@
 
 #include <omp.h>
 #include <cstring>
+#include <iomanip>
 #include <boost/program_options.hpp>
 
 #include "index.h"
@@ -22,12 +23,143 @@
 
 namespace po = boost::program_options;
 
+namespace
+{
+
+size_t file_size_if_exists(const std::string &path)
+{
+    if (!file_exists(path))
+    {
+        return 0;
+    }
+    return get_file_size(path);
+}
+
+void print_size_bytes(const std::string &name, size_t bytes)
+{
+    diskann::cout << std::fixed << std::setprecision(2);
+    diskann::cout << "  " << std::setw(28) << std::left << name << std::right << std::setw(12) << bytes << " bytes ("
+                  << bytes / (1024.0 * 1024.0) << " MiB)" << std::endl;
+}
+
+void report_filtered_diskann_index_size(const std::string &index_path_prefix)
+{
+    const std::vector<std::pair<std::string, std::string>> files = {
+        {"graph", index_path_prefix},
+        {"data", index_path_prefix + ".data"},
+        {"tags", index_path_prefix + ".tags"},
+        {"delete_list", index_path_prefix + ".del"},
+        {"labels", index_path_prefix + "_labels.txt"},
+        {"labels_map", index_path_prefix + "_labels_map.txt"},
+        {"label_formatted", index_path_prefix + "_label_formatted.txt"},
+        {"labels_to_medoids", index_path_prefix + "_labels_to_medoids.txt"},
+        {"universal_label", index_path_prefix + "_universal_label.txt"},
+    };
+
+    size_t total = 0;
+    diskann::cout << "Filtered-DiskANN index size summary:" << std::endl;
+    for (const auto &[name, path] : files)
+    {
+        const size_t bytes = file_size_if_exists(path);
+        if (bytes > 0)
+        {
+            print_size_bytes(name, bytes);
+            total += bytes;
+        }
+    }
+    print_size_bytes("total", total);
+}
+
+void report_cor_index_size(const std::string &index_path_prefix)
+{
+    const std::vector<std::pair<std::string, std::string>> index_files = {
+        {"graph", index_path_prefix},
+        {"data", index_path_prefix + ".data"},
+        {"tags", index_path_prefix + ".tags"},
+        {"delete_list", index_path_prefix + ".del"},
+        {"labels", index_path_prefix + "_labels.txt"},
+        {"labels_map", index_path_prefix + "_labels_map.txt"},
+        {"label_formatted", index_path_prefix + "_label_formatted.txt"},
+        {"labels_to_medoids", index_path_prefix + "_labels_to_medoids.txt"},
+        {"universal_label", index_path_prefix + "_universal_label.txt"},
+    };
+
+    const std::vector<std::pair<std::string, std::string>> other_files = {
+        {"label_corr_matrix", index_path_prefix + "_label_corr_matrix.txt"},
+        {"label_topk", index_path_prefix + "_label_topk.txt"},
+        {"label_occ_count", index_path_prefix + "_label_occ_count.txt"},
+        {"label_pair_edge_count", index_path_prefix + "_label_pair_edge_count.txt"},
+    };
+
+    size_t index_total = 0;
+    size_t other_total = 0;
+
+    diskann::cout << "COR index size summary:" << std::endl;
+    diskann::cout << "Index files:" << std::endl;
+    for (const auto &[name, path] : index_files)
+    {
+        const size_t bytes = file_size_if_exists(path);
+        if (bytes > 0)
+        {
+            print_size_bytes(name, bytes);
+            index_total += bytes;
+        }
+    }
+    print_size_bytes("index subtotal", index_total);
+
+    diskann::cout << "Other structures:" << std::endl;
+    for (const auto &[name, path] : other_files)
+    {
+        const size_t bytes = file_size_if_exists(path);
+        if (bytes > 0)
+        {
+            print_size_bytes(name, bytes);
+            other_total += bytes;
+        }
+    }
+    print_size_bytes("other subtotal", other_total);
+    print_size_bytes("total", index_total + other_total);
+}
+
+void report_vanilla_index_size(const std::string &index_path_prefix)
+{
+    const std::vector<std::pair<std::string, std::string>> files = {
+        {"graph", index_path_prefix},
+        {"data", index_path_prefix + ".data"},
+        {"tags", index_path_prefix + ".tags"},
+        {"delete_list", index_path_prefix + ".del"},
+    };
+
+    size_t total = 0;
+    diskann::cout << "Index size summary:" << std::endl;
+    for (const auto &[name, path] : files)
+    {
+        const size_t bytes = file_size_if_exists(path);
+        if (bytes > 0)
+        {
+            print_size_bytes(name, bytes);
+            total += bytes;
+        }
+    }
+    print_size_bytes("total", total);
+}
+
+} // namespace
+
 int main(int argc, char **argv)
 {
     std::string data_type, dist_fn, data_path, index_path_prefix, label_file, universal_label, label_type;
     uint32_t num_threads, R, L, Lf, build_PQ_bytes;
     float alpha;
     bool use_pq_build, use_opq;
+    bool post_build_label_processing = false;
+    // 【新增参数】查询时扩展的相关标签个数K（默认0不扩展）
+    uint32_t expand_labels_k = 0;
+    uint32_t label_projection_dim = 32;
+    float filter_lazy_update_ratio = 0.01f;
+    uint32_t filter_lazy_update_min_ops = 128;
+    // 属性关系计算方式：0=图拓扑一跳共现（默认），1=属性 centroid 距离
+    uint32_t label_correlation_method = 0;
 
     po::options_description desc{
         program_options_utils::make_program_description("build_memory_index", "Build a memory-based DiskANN index.")};
@@ -70,6 +202,27 @@ int main(int argc, char **argv)
                                        program_options_utils::FILTERED_LBUILD);
         optional_configs.add_options()("label_type", po::value<std::string>(&label_type)->default_value("uint"),
                                        program_options_utils::LABEL_TYPE_DESCRIPTION);
+
+        // 【新增可选参数】查询时扩展Top-K相关标签
+        optional_configs.add_options()("expand_labels_k", po::value<uint32_t>(&expand_labels_k)->default_value(0),
+                                       "Expand to Top-K correlated labels at query time (default 0)");
+        optional_configs.add_options()("label_projection_dim",
+                                       po::value<uint32_t>(&label_projection_dim)->default_value(32),
+                                       "Deprecated compatibility option. Kept for CLI compatibility but ignored.");
+        // 【新增可选参数】仅在建图后处理标签与相关性（不走过滤建图）
+        optional_configs.add_options()("post_build_label_processing",
+                                       po::bool_switch(&post_build_label_processing)->default_value(false),
+                                       "Post-process labels after building a vanilla graph (default false)");
+        optional_configs.add_options()("filter_lazy_update_ratio",
+                                       po::value<float>(&filter_lazy_update_ratio)->default_value(0.01f),
+                                       "Lazy update trigger ratio for filter metadata (default 0.01)");
+        optional_configs.add_options()("filter_lazy_update_min_ops",
+                                       po::value<uint32_t>(&filter_lazy_update_min_ops)->default_value(128),
+                                       "Lazy update trigger minimum ops for filter metadata (default 128)");
+        optional_configs.add_options()("label_correlation_method",
+                                       po::value<uint32_t>(&label_correlation_method)->default_value(0),
+                                       "Label correlation method: 0=graph topology co-occurrence, 1=label centroid "
+                                       "distance (default 0)");
 
         // Merge required and optional parameters
         desc.add(required_configs).add(optional_configs);
@@ -125,12 +278,18 @@ int main(int argc, char **argv)
                                       .with_alpha(alpha)
                                       .with_saturate_graph(false)
                                       .with_num_threads(num_threads)
+                                      .with_num_correlated_labels_to_expand(expand_labels_k)
+                                      .with_label_projection_dim(label_projection_dim)
+                                      .with_filter_lazy_update_ratio(filter_lazy_update_ratio)
+                                      .with_filter_lazy_update_min_ops(filter_lazy_update_min_ops)
+                                      .with_label_correlation_method(label_correlation_method)
                                       .build();
 
         auto filter_params = diskann::IndexFilterParamsBuilder()
                                  .with_universal_label(universal_label)
                                  .with_label_file(label_file)
                                  .with_save_path_prefix(index_path_prefix)
+                                 .with_post_build_label_processing(post_build_label_processing)
                                  .build();
         auto config = diskann::IndexConfigBuilder()
                           .with_metric(metric)
@@ -152,6 +311,20 @@ int main(int argc, char **argv)
         auto index = index_factory.create_instance();
         index->build(data_path, data_num, filter_params);
         index->save(index_path_prefix.c_str());
+
+        if (!label_file.empty() && post_build_label_processing)
+        {
+            report_cor_index_size(index_path_prefix);
+        }
+        else if (!label_file.empty())
+        {
+            report_filtered_diskann_index_size(index_path_prefix);
+        }
+        else
+        {
+            report_vanilla_index_size(index_path_prefix);
+        }
+
         index.reset();
         return 0;
     }

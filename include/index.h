@@ -24,6 +24,8 @@
 
 #include "quantized_distance.h"
 #include "pq_data_store.h"
+#include <atomic>
+#include <tuple>
 
 #define OVERHEAD_FACTOR 1.1
 #define EXPAND_IF_FULL 0
@@ -111,8 +113,60 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
 
     DISKANN_DLLEXPORT void set_universal_label(const LabelT &label);
 
+    // 运行时覆盖查询时标签扩展K（可选）
+    void set_expand_labels_k(uint32_t k) override
+    {
+        _num_correlated_labels_to_expand = k;
+        // 中文说明：属性关系（Top-K）已在构建时按所选方法算好并随索引保存，
+        // 查询阶段直接复用 load() 加载的关系即可，无需（也不应）重算，
+        // 因此查询侧不必关心构建用的是拓扑共现还是 centroid 距离。
+        if (!_label_top_correlations.empty())
+        {
+            return;
+        }
+        // 兜底：未从磁盘加载到任何关系但仍要求扩展时，按默认方法即时计算一次。
+        if (_num_correlated_labels_to_expand > 0 && !_location_to_labels.empty())
+        {
+            calculate_label_correlations();
+            compute_top_k_label_correlations();
+        }
+    }
+
     // Get converted integer label from string to int map (_label_map)
-    DISKANN_DLLEXPORT LabelT get_converted_label(const std::string &raw_label);
+    DISKANN_DLLEXPORT LabelT get_converted_label(const std::string &raw_label) const;
+
+    DISKANN_DLLEXPORT bool matches_any_labels(const TagT &tag, const std::vector<std::string> &raw_labels);
+
+    // 中文说明：支持“多标签 OR 合并搜索”，可指定是否额外加入默认全局起点。
+    // probe_seed_ids 非空时：正式搜索起点为 probe 返回的全部满足 OR 的 seed；不足查询属性个数时用 medoid 补齐。
+    DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t>
+    search_with_filter_label_group(const T *query, const std::vector<std::string> &raw_filter_labels, const size_t K,
+                                   const uint32_t L, uint32_t *indices, float *distances,
+                                   const int expand_num = -1, const bool include_unfiltered_starts = false,
+                                   const std::vector<uint32_t> *probe_seed_ids = nullptr);
+
+    // 中文说明：与上面相同，但输出外部 tag，便于动态索引评测。
+    DISKANN_DLLEXPORT std::pair<size_t, uint32_t>
+    search_with_filter_label_group_tags(const T *query, const uint64_t K, const uint32_t L, TagT *tags,
+                                        float *distances, std::vector<T *> &res_vectors,
+                                        const std::vector<std::string> &raw_filter_labels,
+                                        const int expand_num = -1, const bool include_unfiltered_starts = false,
+                                        const std::vector<uint32_t> *probe_seed_ids = nullptr);
+
+    // 中文说明：以查询属性 medoid 为起点执行无过滤 probe 搜索；返回 R、距离比较次数、满足 OR 的全部 seed。
+    DISKANN_DLLEXPORT std::tuple<double, uint32_t, std::vector<uint32_t>>
+    probe_filter_label_group_valid_ratio(const T *query, const std::vector<std::string> &raw_filter_labels,
+                                         const uint32_t L);
+
+    // 中文说明：基于倒排索引直接枚举候选并爆搜单标签。
+    DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t>
+    brute_force_search_filter_label(const T *query, const std::string &raw_filter_label, const size_t K,
+                                    uint32_t *indices, float *distances);
+
+    // 中文说明：基于倒排索引直接枚举候选并爆搜单标签，输出外部 tag。
+    DISKANN_DLLEXPORT std::pair<size_t, uint32_t>
+    brute_force_search_filter_label_tags(const T *query, const std::string &raw_filter_label, const uint64_t K,
+                                         TagT *tags, float *distances, std::vector<T *> &res_vectors);
 
     // Set starting point of an index before inserting any points incrementally.
     // The data count should be equal to _num_frozen_pts * _aligned_dim.
@@ -137,13 +191,14 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
     // Initialize space for res_vectors before calling.
     DISKANN_DLLEXPORT size_t search_with_tags(const T *query, const uint64_t K, const uint32_t L, TagT *tags,
                                               float *distances, std::vector<T *> &res_vectors, bool use_filters = false,
-                                              const std::string filter_label = "");
+                                              const std::string filter_label = "", const int expand_num = -1);
 
     // Filter support search
     template <typename IndexType>
     DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> search_with_filters(const T *query, const LabelT &filter_label,
                                                                         const size_t K, const uint32_t L,
-                                                                        IndexType *indices, float *distances);
+                                                                        IndexType *indices, float *distances,
+                                                                        const int expand_num = -1);
 
     // Will fail if tag already in the index or if tag=0.
     DISKANN_DLLEXPORT int insert_point(const T *point, const TagT tag);
@@ -208,7 +263,8 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
                                                   std::any &indices, float *distances = nullptr) override;
     virtual std::pair<uint32_t, uint32_t> _search_with_filters(const DataType &query,
                                                                const std::string &filter_label_raw, const size_t K,
-                                                               const uint32_t L, std::any &indices,
+                                                               const uint32_t L, const int expand_num,
+                                                               std::any &indices,
                                                                float *distances) override;
 
     virtual int _insert_point(const DataType &data_point, const TagType tag) override;
@@ -222,13 +278,15 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
 
     virtual void _set_start_points_at_random(DataType radius, uint32_t random_seed = 0) override;
 
+    virtual bool _matches_any_labels(const TagType &tag, const std::vector<std::string> &raw_labels) override;
+
     virtual int _get_vector_by_tag(TagType &tag, DataType &vec) override;
 
     virtual void _search_with_optimized_layout(const DataType &query, size_t K, size_t L, uint32_t *indices) override;
 
     virtual size_t _search_with_tags(const DataType &query, const uint64_t K, const uint32_t L, const TagType &tags,
                                      float *distances, DataVector &res_vectors, bool use_filters = false,
-                                     const std::string filter_label = "") override;
+                                     const std::string filter_label = "", const int expand_num = -1) override;
 
     virtual void _set_universal_label(const LabelType universal_label) override;
 
@@ -248,6 +306,12 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
     uint32_t calculate_entry_point();
 
     void parse_label_file(const std::string &label_file, size_t &num_pts_labels);
+
+    // 【新增声明 - 中文说明】基于已加载的标签，准备频率统计与标签起点
+    void prepare_label_metadata(const size_t num_points_to_load);
+
+    // 计算每个标签的Top-K相关标签（按一跳图邻居属性共现次数降序）
+    void compute_top_k_label_correlations();
 
     std::unordered_map<std::string, LabelT> load_label_map(const std::string &map_file);
 
@@ -276,6 +340,63 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
     void occlude_list(const uint32_t location, std::vector<Neighbor> &pool, const float alpha, const uint32_t degree,
                       const uint32_t maxc, std::vector<uint32_t> &result, InMemQueryScratch<T> *scratch,
                       const tsl::robin_set<uint32_t> *const delete_set_ptr = nullptr);
+
+    // 【新增声明 - 中文说明】计算标签相关性的内部方法，在构建过滤索引前调用
+    void calculate_label_correlations();
+    // 基于一跳图邻居属性共现次数，重算给定标签集合的 Top-K 相关标签
+    size_t recompute_label_top_correlations(const std::vector<LabelT> &labels);
+    // 中文说明：按 label 的活跃向量均值计算每个标签的 centroid（属性质心）。
+    void compute_label_centroids();
+    // 中文说明：基于属性 centroid 距离（越近关系越强）重算给定标签集合的 Top-K 相关标签。
+    size_t recompute_label_top_correlations_by_centroid(const std::vector<LabelT> &labels);
+    // 中文说明：两个属性 centroid 之间的距离（L2），用于 centroid 关系计算。
+    float label_centroid_distance(const std::vector<float> &lhs, const std::vector<float> &rhs) const;
+
+    // 【新增声明 - 中文说明】增量插入时，使用新点的标签更新相关性统计与矩阵
+    void update_label_correlations_incremental(const std::vector<LabelT> &labels);
+
+    struct PendingLabelEvent
+    {
+        bool is_insert = true;
+        TagT tag{};
+        uint32_t location = 0;
+        uint64_t seq = 0;
+    };
+
+    // 判断是否达到标签元数据懒更新阈值（基于插入+删除累计次数）
+    bool need_flush_pending_label_updates() const;
+    // 应用累积的标签元数据增量（medoid、相关性、Top-K）
+    void flush_pending_label_updates(const bool force = false);
+    // 记录插入事件及对应标签增量
+    void record_insert_label_updates(uint32_t location, const TagT tag, const T *point,
+                                     const std::vector<LabelT> &labels);
+    // 记录删除事件及对应标签增量
+    void record_delete_label_updates(uint32_t location, const TagT tag);
+    // 批量更新时，仅刷新脏标签的medoid
+    void refresh_dirty_label_medoids();
+    // 批量更新时，基于簇筛选仅刷新受影响标签的 Top-K 相关性
+    void refresh_dirty_label_correlations();
+
+    // 中文说明：把原始标签字符串转换成内部标签ID；允许直接传数值字符串。
+    bool try_convert_label(const std::string &raw_label, LabelT &label) const;
+    // 中文说明：批量转换并排序去重，忽略无法识别的标签。
+    std::vector<LabelT> convert_filter_labels(const std::vector<std::string> &raw_filter_labels) const;
+    // 中文说明：把原始查询标签与相关标签扩展合并成真正参与图遍历的过滤集合。
+    std::vector<LabelT> build_expanded_filter_labels(const std::vector<LabelT> &base_labels, int expand_num) const;
+    // 中文说明：重建“标签 -> 活跃向量 location”的倒排索引。
+    void rebuild_filter_inverted_index();
+    // 中文说明：插入时把 location 加入对应标签的倒排链。
+    void add_location_to_filter_inverted_index(uint32_t location, const std::vector<LabelT> &labels);
+    // 中文说明：删除时把 location 从对应标签的倒排链移除。
+    void remove_location_from_filter_inverted_index(uint32_t location, const std::vector<LabelT> &labels);
+    // 中文说明：收集单标签爆搜候选；若启用了 universal label，会自动合并对应 posting。
+    void collect_bruteforce_filter_candidates(const LabelT &filter_label, std::vector<uint32_t> &candidate_locations) const;
+
+    template <typename IdType>
+    std::pair<uint32_t, uint32_t> brute_force_search_pending_label(const T *query, const LabelT &filter_label,
+                                                                   const size_t K, IdType *indices, float *distances,
+                                                                   const bool return_tags = false,
+                                                                   std::vector<T *> *res_vectors = nullptr);
 
     // add reverse links from all the visited nodes to node n.
     void inter_insert(uint32_t n, std::vector<uint32_t> &pruned_list, const uint32_t range,
@@ -389,12 +510,50 @@ template <typename T, typename TagT = uint32_t, typename LabelT = uint32_t> clas
     uint32_t _filterIndexingQueueSize;
     std::unordered_map<std::string, LabelT> _label_map;
 
+    // 【新增成员 - 中文说明】标签相关性缓存：当前仅缓存已重算标签的候选共现次数
+    // 采用嵌套map: labelA -> (labelB -> count)
+    std::unordered_map<LabelT, std::unordered_map<LabelT, float>> _label_correlation_matrix;
+
+    // 每个标签的Top-K相关标签列表，pair.first 表示共现次数
+    std::unordered_map<LabelT, std::vector<std::pair<float, LabelT>>> _label_top_correlations;
+
+    // 属性关系计算方式：0=图拓扑一跳共现（默认），1=属性 centroid 距离
+    uint32_t _label_correlation_method{0};
+    // centroid 方式使用：每个标签的属性质心（活跃向量均值）
+    std::unordered_map<LabelT, std::vector<float>> _label_centroids;
+
+    // 【新增成员 - 中文说明】相关性统计：标签出现次数与标签对共现次数（用于增量更新）
+    std::unordered_map<LabelT, uint64_t> _label_occurrence_count; // count(label)
+    // cnt(labelA,labelB)：剪枝后图中“拓扑边”产生的连接次数（对称累计）
+    std::unordered_map<LabelT, std::unordered_map<LabelT, uint64_t>> _label_pair_edge_count;
+
     // Indexing parameters
     uint32_t _indexingQueueSize;
     uint32_t _indexingRange;
     uint32_t _indexingMaxC;
     float _indexingAlpha;
     uint32_t _indexingThreads;
+
+    // 查询时扩展的K
+    uint32_t _num_correlated_labels_to_expand{0};
+
+    // 标签元数据懒更新：累计插入+删除次数
+    std::atomic<uint64_t> _pending_label_update_ops{0};
+    float _filter_lazy_update_ratio{0.01f};
+    uint32_t _filter_lazy_update_min_ops{128};
+    uint64_t _pending_event_seq{0};
+    tsl::robin_set<LabelT> _dirty_labels;
+    // 关系矩阵维护：标签出现次数的待应用增量（供 flush 更新 _label_occurrence_count）
+    std::unordered_map<LabelT, int64_t> _pending_label_occurrence_delta;
+
+    // 新标签在批量刷新前使用临时事件序列进行暴力扫描查询
+    tsl::robin_set<LabelT> _pending_new_labels;
+    std::unordered_map<LabelT, std::vector<PendingLabelEvent>> _pending_new_label_events;
+
+    // label -> 活跃tag集合（用于局部重选medoid）
+    std::unordered_map<LabelT, tsl::robin_set<TagT>> _label_to_active_tags;
+    // 标签 -> 活跃向量 location 集合（用于低频标签直接爆搜）
+    std::unordered_map<LabelT, tsl::robin_set<uint32_t>> _filter_inverted_index;
 
     // Query scratch data structures
     ConcurrentQueue<InMemQueryScratch<T> *> _query_scratch;

@@ -3,10 +3,12 @@
 
 #include <omp.h>
 
+#include <random>
 #include <type_traits>
 
 #include "boost/dynamic_bitset.hpp"
 #include "index_factory.h"
+#include "math_utils.h"
 #include "memory_mapper.h"
 #include "timer.h"
 #include "tsl/robin_map.h"
@@ -27,6 +29,7 @@
 
 namespace diskann
 {
+
 // Initialize an index with metric m, load the data of type T with filename
 // (bin), and initialize max_points
 template <typename T, typename TagT, typename LabelT>
@@ -86,10 +89,6 @@ Index<T, TagT, LabelT>::Index(const IndexConfig &index_config, std::shared_ptr<A
     if (_dynamic_index)
     {
         this->enable_delete(); // enable delete by default for dynamic index
-        if (_filtered_index)
-        {
-            _location_to_labels.resize(total_internal_points);
-        }
     }
 
     if (index_config.index_write_params != nullptr)
@@ -101,6 +100,13 @@ Index<T, TagT, LabelT>::Index(const IndexConfig &index_config, std::shared_ptr<A
         _filterIndexingQueueSize = index_config.index_write_params->filter_list_size;
         _indexingThreads = index_config.index_write_params->num_threads;
         _saturate_graph = index_config.index_write_params->saturate_graph;
+
+        // 【新增初始化】查询时扩展K（label_projection_dim 为兼容保留参数，已忽略）
+        _num_correlated_labels_to_expand = index_config.index_write_params->num_correlated_labels_to_expand;
+        _filter_lazy_update_ratio = index_config.index_write_params->filter_lazy_update_ratio;
+        _filter_lazy_update_min_ops = index_config.index_write_params->filter_lazy_update_min_ops;
+        // 属性关系计算方式：0=图拓扑共现，1=属性 centroid 距离
+        _label_correlation_method = index_config.index_write_params->label_correlation_method;
 
         if (index_config.index_search_params != nullptr)
         {
@@ -154,6 +160,275 @@ Index<T, TagT, LabelT>::Index(Metric m, const size_t dim, const size_t max_point
     {
         _pq_data_store = _data_store;
     }
+}
+
+template <typename T, typename TagT, typename LabelT>
+size_t Index<T, TagT, LabelT>::recompute_label_top_correlations(const std::vector<LabelT> &labels)
+{
+    size_t cooccurrence_events = 0;
+    if (_num_correlated_labels_to_expand == 0)
+    {
+        return cooccurrence_events;
+    }
+
+    for (const auto &label : labels)
+    {
+        auto occ_it = _label_occurrence_count.find(label);
+        if (occ_it == _label_occurrence_count.end() || occ_it->second == 0)
+        {
+            _label_top_correlations.erase(label);
+            _label_correlation_matrix.erase(label);
+            continue;
+        }
+
+        std::unordered_map<LabelT, uint64_t> related_counts;
+        tsl::robin_set<uint32_t> source_locations;
+        auto source_it = _filter_inverted_index.find(label);
+        if (source_it != _filter_inverted_index.end())
+        {
+            for (const auto &location : source_it->second)
+            {
+                source_locations.insert(location);
+            }
+        }
+        if (_use_universal_label && label != _universal_label)
+        {
+            auto universal_it = _filter_inverted_index.find(_universal_label);
+            if (universal_it != _filter_inverted_index.end())
+            {
+                for (const auto &location : universal_it->second)
+                {
+                    source_locations.insert(location);
+                }
+            }
+        }
+        if (source_locations.empty())
+        {
+            _label_top_correlations.erase(label);
+            _label_correlation_matrix.erase(label);
+            continue;
+        }
+
+        auto add_related_labels = [&](const std::vector<LabelT> &node_labels) {
+            for (const auto &candidate_label : node_labels)
+            {
+                if (candidate_label == label)
+                {
+                    continue;
+                }
+                if (_use_universal_label && candidate_label == _universal_label)
+                {
+                    continue;
+                }
+                related_counts[candidate_label] += 1;
+                cooccurrence_events++;
+            }
+        };
+
+        const size_t graph_points = _graph_store == nullptr ? 0 : _graph_store->get_total_points();
+        for (const auto &location : source_locations)
+        {
+            if (location >= _location_to_labels.size() || location >= _max_points)
+            {
+                continue;
+            }
+
+            if (location >= graph_points)
+            {
+                continue;
+            }
+            for (const auto &neighbor : _graph_store->get_neighbours((location_t)location))
+            {
+                if (neighbor >= _location_to_labels.size() || neighbor >= _max_points)
+                {
+                    continue;
+                }
+                if (_delete_set != nullptr && _delete_set->find(neighbor) != _delete_set->end())
+                {
+                    continue;
+                }
+                // 中文说明：只统计一跳图邻居上的属性，零跳同节点属性不参与相关度。
+                add_related_labels(_location_to_labels[neighbor]);
+            }
+        }
+
+        std::vector<std::pair<float, LabelT>> items;
+        items.reserve(related_counts.size());
+        for (const auto &kv : related_counts)
+        {
+            items.emplace_back(static_cast<float>(kv.second), kv.first);
+        }
+
+        const size_t take_n = std::min<size_t>(_num_correlated_labels_to_expand, items.size());
+        if (items.size() > take_n && take_n > 0)
+        {
+            std::nth_element(items.begin(), items.begin() + static_cast<ptrdiff_t>(take_n), items.end(),
+                             [](const auto &lhs, const auto &rhs) {
+                                 return lhs.first > rhs.first ||
+                                        (lhs.first == rhs.first && lhs.second < rhs.second);
+                             });
+            items.resize(take_n);
+        }
+        std::sort(items.begin(), items.end(), [](const auto &lhs, const auto &rhs) {
+            return lhs.first > rhs.first || (lhs.first == rhs.first && lhs.second < rhs.second);
+        });
+
+        _label_top_correlations[label] = items;
+        auto &row = _label_correlation_matrix[label];
+        row.clear();
+        for (const auto &item : items)
+        {
+            row[item.second] = item.first;
+        }
+    }
+
+    return cooccurrence_events;
+}
+
+// 中文说明：计算每个属性的 centroid（该属性所有活跃向量的均值）。
+// 数据来源为 _filter_inverted_index（label -> 活跃 location 集合），universal label 不做展开。
+template <typename T, typename TagT, typename LabelT> void Index<T, TagT, LabelT>::compute_label_centroids()
+{
+    _label_centroids.clear();
+    if (_filter_inverted_index.empty() || _dim == 0)
+    {
+        return;
+    }
+
+    const size_t aligned_dim = _data_store->get_aligned_dim();
+    std::vector<T> vec(aligned_dim, (T)0);
+
+    for (const auto &kv : _filter_inverted_index)
+    {
+        const LabelT label = kv.first;
+        const auto &locations = kv.second;
+        if (locations.empty())
+        {
+            continue;
+        }
+
+        std::vector<double> sum(_dim, 0.0);
+        uint64_t count = 0;
+        for (const auto &location : locations)
+        {
+            if (location >= _max_points)
+            {
+                continue;
+            }
+            _data_store->get_vector(location, vec.data());
+            for (size_t d = 0; d < _dim; d++)
+            {
+                sum[d] += (double)vec[d];
+            }
+            count++;
+        }
+
+        if (count == 0)
+        {
+            continue;
+        }
+
+        auto &centroid = _label_centroids[label];
+        centroid.resize(_dim);
+        for (size_t d = 0; d < _dim; d++)
+        {
+            centroid[d] = (float)(sum[d] / (double)count);
+        }
+    }
+}
+
+// 中文说明：两个属性 centroid 之间的 L2 距离（距离越小关系越强）。
+template <typename T, typename TagT, typename LabelT>
+float Index<T, TagT, LabelT>::label_centroid_distance(const std::vector<float> &lhs,
+                                                      const std::vector<float> &rhs) const
+{
+    const size_t dims = std::min(lhs.size(), rhs.size());
+    double dist = 0.0;
+    for (size_t d = 0; d < dims; d++)
+    {
+        const double diff = (double)lhs[d] - (double)rhs[d];
+        dist += diff * diff;
+    }
+    return (float)std::sqrt(dist);
+}
+
+// 中文说明：基于属性 centroid 距离计算给定标签集合的 Top-K 相关标签（最近的若干个属性视为关系最强）。
+// _label_top_correlations[label] 按“最近优先”排序（pair.first 存放距离，pair.second 为相关标签）。
+template <typename T, typename TagT, typename LabelT>
+size_t Index<T, TagT, LabelT>::recompute_label_top_correlations_by_centroid(const std::vector<LabelT> &labels)
+{
+    size_t related_events = 0;
+    if (_num_correlated_labels_to_expand == 0)
+    {
+        return related_events;
+    }
+
+    for (const auto &label : labels)
+    {
+        auto occ_it = _label_occurrence_count.find(label);
+        if (occ_it == _label_occurrence_count.end() || occ_it->second == 0)
+        {
+            _label_top_correlations.erase(label);
+            _label_correlation_matrix.erase(label);
+            continue;
+        }
+
+        auto src_it = _label_centroids.find(label);
+        if (src_it == _label_centroids.end() || src_it->second.empty())
+        {
+            _label_top_correlations.erase(label);
+            _label_correlation_matrix.erase(label);
+            continue;
+        }
+        const auto &src_centroid = src_it->second;
+
+        std::vector<std::pair<float, LabelT>> items;
+        items.reserve(_label_centroids.size());
+        for (const auto &kv : _label_centroids)
+        {
+            const LabelT candidate_label = kv.first;
+            if (candidate_label == label)
+            {
+                continue;
+            }
+            if (_use_universal_label && candidate_label == _universal_label)
+            {
+                continue;
+            }
+            if (kv.second.empty())
+            {
+                continue;
+            }
+            const float dist = label_centroid_distance(src_centroid, kv.second);
+            items.emplace_back(dist, candidate_label);
+            related_events++;
+        }
+
+        // 中文说明：按距离升序取最近的 Top-K（距离越小关系越强）。
+        const size_t take_n = std::min<size_t>(_num_correlated_labels_to_expand, items.size());
+        if (items.size() > take_n && take_n > 0)
+        {
+            std::nth_element(items.begin(), items.begin() + static_cast<ptrdiff_t>(take_n), items.end(),
+                             [](const auto &lhs, const auto &rhs) {
+                                 return lhs.first < rhs.first ||
+                                        (lhs.first == rhs.first && lhs.second < rhs.second);
+                             });
+            items.resize(take_n);
+        }
+        std::sort(items.begin(), items.end(), [](const auto &lhs, const auto &rhs) {
+            return lhs.first < rhs.first || (lhs.first == rhs.first && lhs.second < rhs.second);
+        });
+
+        _label_top_correlations[label] = items;
+        auto &row = _label_correlation_matrix[label];
+        row.clear();
+        for (const auto &item : items)
+        {
+            row[item.second] = item.first;
+        }
+    }
+
+    return related_events;
 }
 
 template <typename T, typename TagT, typename LabelT> Index<T, TagT, LabelT>::~Index()
@@ -267,6 +542,9 @@ size_t Index<T, TagT, LabelT>::save_delete_list(const std::string &filename)
 template <typename T, typename TagT, typename LabelT>
 void Index<T, TagT, LabelT>::save(const char *filename, bool compact_before_save)
 {
+    // 保存前先将懒更新的标签元数据全部落地，避免持久化不一致
+    flush_pending_label_updates(true);
+
     diskann::Timer timer;
 
     std::unique_lock<std::shared_timed_mutex> ul(_update_lock);
@@ -290,7 +568,7 @@ void Index<T, TagT, LabelT>::save(const char *filename, bool compact_before_save
 
     if (!_save_as_one_file)
     {
-        if (_filtered_index)
+        if (_filtered_index || !_location_to_labels.empty() || !_label_to_start_id.empty() || _use_universal_label)
         {
             if (_label_to_start_id.size() > 0)
             {
@@ -318,7 +596,8 @@ void Index<T, TagT, LabelT>::save(const char *filename, bool compact_before_save
             {
                 std::ofstream label_writer(std::string(filename) + "_labels.txt");
                 assert(label_writer.is_open());
-                for (uint32_t i = 0; i < _nd + _num_frozen_pts; i++)
+                // 中文说明：标签文件只持久化真实数据点，冻结点标签由其他元数据恢复。
+                for (uint32_t i = 0; i < _nd; i++)
                 {
                     for (uint32_t j = 0; j + 1 < _location_to_labels[i].size(); j++)
                     {
@@ -345,7 +624,7 @@ void Index<T, TagT, LabelT>::save(const char *filename, bool compact_before_save
                     // write updated labels
                     std::ofstream raw_label_writer(std::string(filename) + "_raw_labels.txt");
                     assert(raw_label_writer.is_open());
-                    for (uint32_t i = 0; i < _nd + _num_frozen_pts; i++)
+                    for (uint32_t i = 0; i < _nd; i++)
                     {
                         for (uint32_t j = 0; j + 1 < _location_to_labels[i].size(); j++)
                         {
@@ -358,6 +637,78 @@ void Index<T, TagT, LabelT>::save(const char *filename, bool compact_before_save
                         raw_label_writer << std::endl;
                     }
                     raw_label_writer.close();
+                }
+
+                // Persist label correlation related artifacts, if available
+                // 1) Correlation matrix
+                if (!_label_correlation_matrix.empty())
+                {
+                    std::ofstream out(std::string(filename) + "_label_corr_matrix.txt");
+                    for (const auto &ra : _label_correlation_matrix)
+                    {
+                        out << ra.first << '\t';
+                        bool first = true;
+                        for (const auto &rb : ra.second)
+                        {
+                            if (!first)
+                                out << ';';
+                            out << rb.first << "," << rb.second;
+                            first = false;
+                        }
+                        out << '\n';
+                    }
+                    out.close();
+                }
+
+                // 2) 每个标签按共现次数降序排列的 Top-K 相关标签
+                if (!_label_top_correlations.empty())
+                {
+                    std::ofstream out(std::string(filename) + "_label_topk.txt");
+                    for (const auto &it : _label_top_correlations)
+                    {
+                        out << it.first << '\t';
+                        bool first = true;
+                        for (const auto &pr : it.second)
+                        {
+                            if (!first)
+                                out << ';';
+                            out << pr.second << "," << pr.first; // 存储为 label,count
+                            first = false;
+                        }
+                        out << '\n';
+                    }
+                    out.close();
+                }
+
+                // 3) Label occurrence count
+                if (!_label_occurrence_count.empty())
+                {
+                    std::ofstream out(std::string(filename) + "_label_occ_count.txt");
+                    for (const auto &kv : _label_occurrence_count)
+                    {
+                        out << kv.first << '\t' << kv.second << '\n';
+                    }
+                    out.close();
+                }
+
+                // 4) Label pair edge count (post-prune graph topology)
+                if (!_label_pair_edge_count.empty())
+                {
+                    std::ofstream out(std::string(filename) + "_label_pair_edge_count.txt");
+                    for (const auto &ra : _label_pair_edge_count)
+                    {
+                        out << ra.first << '\t';
+                        bool first = true;
+                        for (const auto &rb : ra.second)
+                        {
+                            if (!first)
+                                out << ';';
+                            out << rb.first << "," << rb.second;
+                            first = false;
+                        }
+                        out << '\n';
+                    }
+                    out.close();
                 }
             }
         }
@@ -592,7 +943,22 @@ void Index<T, TagT, LabelT>::load(const char *filename, uint32_t num_threads, ui
     {
         _label_map = load_label_map(labels_map_file);
         parse_label_file(labels_file, label_num_pts);
-        assert(label_num_pts == data_file_num_pts - _num_frozen_pts);
+        if (_dynamic_index && _location_to_labels.size() < data_file_num_pts)
+        {
+            _location_to_labels.resize(data_file_num_pts);
+        }
+        // 中文说明：兼容旧版本保存的“包含冻结点标签”的文件，以及新版本“仅真实点标签”的文件。
+        const size_t expected_label_pts = data_file_num_pts - _num_frozen_pts;
+        const bool full_label_dump = (label_num_pts == data_file_num_pts);
+        const bool compact_label_dump = (label_num_pts == expected_label_pts);
+        if (!full_label_dump && !compact_label_dump)
+        {
+            std::stringstream stream;
+            stream << "ERROR: Label file contains " << label_num_pts << " entries, expected either "
+                   << expected_label_pts << " (data points only) or " << data_file_num_pts
+                   << " (including frozen points)." << std::endl;
+            throw diskann::ANNException(stream.str(), -1, __FUNCSIG__, __FILE__, __LINE__);
+        }
         if (file_exists(labels_to_medoids))
         {
             std::ifstream medoid_stream(labels_to_medoids);
@@ -632,6 +998,145 @@ void Index<T, TagT, LabelT>::load(const char *filename, uint32_t num_threads, ui
             _use_universal_label = true;
             universal_label_reader.close();
         }
+
+        // Load label correlation persistence files if present
+        {
+            // 1) Correlation matrix
+            std::string corr_matrix_file = std::string(filename) + "_label_corr_matrix.txt";
+            if (file_exists(corr_matrix_file))
+            {
+                _label_correlation_matrix.clear();
+                std::ifstream in(corr_matrix_file);
+                std::string line;
+                while (std::getline(in, line))
+                {
+                    if (line.empty())
+                        continue;
+                    std::istringstream iss(line);
+                    std::string token;
+                    // labelA
+                    if (!std::getline(iss, token, '\t'))
+                        continue;
+                    LabelT a = (LabelT)std::stoul(token);
+                    // pairs: labelB,count;labelB2,count2;...
+                    if (std::getline(iss, token))
+                    {
+                        std::istringstream pairs_stream(token);
+                        std::string pair_tok;
+                        while (std::getline(pairs_stream, pair_tok, ';'))
+                        {
+                            if (pair_tok.empty())
+                                continue;
+                            size_t comma_pos = pair_tok.find(',');
+                            if (comma_pos == std::string::npos)
+                                continue;
+                            LabelT b = (LabelT)std::stoul(pair_tok.substr(0, comma_pos));
+                            float s = std::stof(pair_tok.substr(comma_pos + 1));
+                            _label_correlation_matrix[a][b] = s;
+                        }
+                    }
+                }
+            }
+
+            // 2) 每个标签按共现次数降序排列的 Top-K 相关标签
+            std::string topk_file = std::string(filename) + "_label_topk.txt";
+            if (file_exists(topk_file))
+            {
+                _label_top_correlations.clear();
+                std::ifstream in(topk_file);
+                std::string line;
+                while (std::getline(in, line))
+                {
+                    if (line.empty())
+                        continue;
+                    std::istringstream iss(line);
+                    std::string token;
+                    if (!std::getline(iss, token, '\t'))
+                        continue;
+                    LabelT a = (LabelT)std::stoul(token);
+                    if (std::getline(iss, token))
+                    {
+                        std::istringstream pairs_stream(token);
+                        std::string pair_tok;
+                        std::vector<std::pair<float, LabelT>> items;
+                        while (std::getline(pairs_stream, pair_tok, ';'))
+                        {
+                            if (pair_tok.empty())
+                                continue;
+                            size_t comma_pos = pair_tok.find(',');
+                            if (comma_pos == std::string::npos)
+                                continue;
+                            LabelT b = (LabelT)std::stoul(pair_tok.substr(0, comma_pos));
+                            float count = std::stof(pair_tok.substr(comma_pos + 1));
+                            items.emplace_back(count, b);
+                        }
+                        _label_top_correlations[a] = std::move(items);
+                    }
+                }
+            }
+
+            // 3) Label occurrence count
+            std::string occ_file = std::string(filename) + "_label_occ_count.txt";
+            if (file_exists(occ_file))
+            {
+                _label_occurrence_count.clear();
+                std::ifstream in(occ_file);
+                std::string line;
+                while (std::getline(in, line))
+                {
+                    if (line.empty())
+                        continue;
+                    std::istringstream iss(line);
+                    std::string la, cnts;
+                    if (!std::getline(iss, la, '\t'))
+                        continue;
+                    if (!std::getline(iss, cnts))
+                        continue;
+                    LabelT a = (LabelT)std::stoul(la);
+                    uint64_t c = (uint64_t)std::stoull(cnts);
+                    _label_occurrence_count[a] = c;
+                }
+            }
+
+            // 4) Label pair edge count (post-prune graph topology)
+            // - 新版本优先读取 _label_pair_edge_count.txt
+            // - 兼容旧版本：若没有新文件，则回退读取 _label_pair_coocc_count.txt
+            std::string edge_cnt_file = std::string(filename) + "_label_pair_edge_count.txt";
+            std::string legacy_coocc_file = std::string(filename) + "_label_pair_coocc_count.txt";
+            std::string cnt_file_to_read = file_exists(edge_cnt_file) ? edge_cnt_file : legacy_coocc_file;
+            if (file_exists(cnt_file_to_read))
+            {
+                _label_pair_edge_count.clear();
+                std::ifstream in(cnt_file_to_read);
+                std::string line;
+                while (std::getline(in, line))
+                {
+                    if (line.empty())
+                        continue;
+                    std::istringstream iss(line);
+                    std::string token;
+                    if (!std::getline(iss, token, '\t'))
+                        continue;
+                    LabelT a = (LabelT)std::stoul(token);
+                    if (std::getline(iss, token))
+                    {
+                        std::istringstream pairs_stream(token);
+                        std::string pair_tok;
+                        while (std::getline(pairs_stream, pair_tok, ';'))
+                        {
+                            if (pair_tok.empty())
+                                continue;
+                            size_t comma_pos = pair_tok.find(',');
+                            if (comma_pos == std::string::npos)
+                                continue;
+                            LabelT b = (LabelT)std::stoul(pair_tok.substr(0, comma_pos));
+                            uint64_t c = (uint64_t)std::stoull(pair_tok.substr(comma_pos + 1));
+                            _label_pair_edge_count[a][b] = c;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     _nd = data_file_num_pts - _num_frozen_pts;
@@ -641,6 +1146,31 @@ void Index<T, TagT, LabelT>::load(const char *filename, uint32_t num_threads, ui
     {
         _empty_slots.insert((uint32_t)i);
     }
+
+    // 重建标签倒排与 label -> active tags 映射，并清空懒更新缓存
+    rebuild_filter_inverted_index();
+    _label_to_active_tags.clear();
+    if (!_location_to_labels.empty() && _enable_tags)
+    {
+        for (const auto &kv : _tag_to_location)
+        {
+            const TagT tag = kv.first;
+            const uint32_t loc = kv.second;
+            if (loc >= _location_to_labels.size())
+            {
+                continue;
+            }
+            for (const auto &label : _location_to_labels[loc])
+            {
+                _label_to_active_tags[label].insert(tag);
+            }
+        }
+    }
+    _dirty_labels.clear();
+    _pending_label_occurrence_delta.clear();
+    _pending_new_labels.clear();
+    _pending_new_label_events.clear();
+    _pending_label_update_ops.store(0, std::memory_order_relaxed);
 
     reposition_frozen_point_to_end();
     diskann::cout << "Num frozen points:" << _num_frozen_pts << " _nd: " << _nd << " _start: " << _start
@@ -730,6 +1260,77 @@ template <typename T, typename TagT, typename LabelT> int Index<T, TagT, LabelT>
     return 0;
 }
 
+template <typename T, typename TagT, typename LabelT>
+bool Index<T, TagT, LabelT>::_matches_any_labels(const TagType &tag, const std::vector<std::string> &raw_labels)
+{
+    try
+    {
+        const TagT tag_val = std::any_cast<TagT>(tag);
+        return this->matches_any_labels(tag_val, raw_labels);
+    }
+    catch (const std::bad_any_cast &e)
+    {
+        throw ANNException("Error: bad any cast while performing _matches_any_labels() " + std::string(e.what()), -1);
+    }
+    catch (const std::exception &e)
+    {
+        throw ANNException("Error: " + std::string(e.what()), -1);
+    }
+}
+
+template <typename T, typename TagT, typename LabelT>
+bool Index<T, TagT, LabelT>::matches_any_labels(const TagT &tag, const std::vector<std::string> &raw_labels)
+{
+    if (raw_labels.empty())
+    {
+        return false;
+    }
+
+    std::vector<LabelT> converted_labels;
+    converted_labels.reserve(raw_labels.size());
+    for (const auto &raw_label : raw_labels)
+    {
+        try
+        {
+            converted_labels.emplace_back(this->get_converted_label(raw_label));
+        }
+        catch (const std::exception &)
+        {
+            try
+            {
+                converted_labels.emplace_back((LabelT)std::stoull(raw_label));
+            }
+            catch (const std::exception &)
+            {
+                continue;
+            }
+        }
+    }
+
+    if (converted_labels.empty())
+    {
+        return false;
+    }
+
+    std::shared_lock<std::shared_timed_mutex> lock(_tag_lock);
+    auto tag_it = _tag_to_location.find(tag);
+    if (tag_it == _tag_to_location.end())
+    {
+        return false;
+    }
+
+    const location_t location = tag_it->second;
+    const auto &point_labels = _location_to_labels[location];
+    for (const auto &label : converted_labels)
+    {
+        if (std::find(point_labels.begin(), point_labels.end(), label) != point_labels.end())
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 template <typename T, typename TagT, typename LabelT> uint32_t Index<T, TagT, LabelT>::calculate_entry_point()
 {
     // REFACTOR TODO: This function does not support multi-threaded calculation of medoid.
@@ -785,7 +1386,7 @@ bool Index<T, TagT, LabelT>::detect_common_filters(uint32_t point_id, bool searc
         }
     }
     // intersection empty; proceed to check the universal label logic
-    
+
     if (_use_universal_label)
     {
         if (!search_invocation)
@@ -808,6 +1409,12 @@ std::pair<uint32_t, uint32_t> Index<T, TagT, LabelT>::iterate_to_fixed_point(
     InMemQueryScratch<T> *scratch, const uint32_t Lsize, const std::vector<uint32_t> &init_ids, bool use_filter,
     const std::vector<LabelT> &filter_labels, bool search_invocation)
 {
+
+    // if(filter_labels.size() >1){
+    //     std::cout<<"ok checked"<<std::endl;
+    // }
+    // std::cout<<"filter_labels.size(): "<<filter_labels.size()<<std::endl;
+
     std::vector<Neighbor> &expanded_nodes = scratch->pool();
     NeighborPriorityQueue &best_L_nodes = scratch->best_l_nodes();
     best_L_nodes.reserve(Lsize);
@@ -996,7 +1603,7 @@ void Index<T, TagT, LabelT>::search_for_point_and_prune(int location, uint32_t L
                                                         InMemQueryScratch<T> *scratch, bool use_filter,
                                                         uint32_t filteredLindex)
 {
-    const std::vector<uint32_t> init_ids = get_init_ids();
+    std::vector<uint32_t> init_ids = get_init_ids();
     const std::vector<LabelT> unused_filter_label;
 
     if (!use_filter)
@@ -1162,6 +1769,528 @@ void Index<T, TagT, LabelT>::occlude_list(const uint32_t location, std::vector<N
         }
         cur_alpha *= 1.2f;
     }
+}
+
+// 【修改实现 - 中文说明】
+// 全量重建标签出现次数与倒排索引，相关度由一跳图邻居属性共现次数决定。
+template <typename T, typename TagT, typename LabelT> void Index<T, TagT, LabelT>::calculate_label_correlations()
+{
+    diskann::Timer total_timer;
+    // 仅在标签数据可用时计算
+    if (_location_to_labels.empty())
+        return;
+    _label_correlation_matrix.clear();
+    _label_top_correlations.clear();
+
+    std::unordered_map<LabelT, uint64_t> label_counts;
+    const uint32_t real_points = static_cast<uint32_t>(_max_points);
+    size_t scanned_points = 0;
+    size_t label_assignments = 0;
+
+    auto add_point_to_label = [&](const LabelT label) {
+        label_counts[label] += 1;
+    };
+
+    for (uint32_t point_id = 0; point_id < real_points && point_id < _location_to_labels.size(); ++point_id)
+    {
+        const auto &labels = _location_to_labels[point_id];
+        if (labels.empty())
+            continue;
+
+        scanned_points++;
+
+        for (const auto &la : labels)
+        {
+            if (_use_universal_label && la == _universal_label)
+            {
+                for (auto itr = _labels.begin(); itr != _labels.end(); ++itr)
+                {
+                    const LabelT x = *itr;
+                    if (x == _universal_label)
+                        continue;
+                    label_assignments++;
+                    add_point_to_label(x);
+                }
+            }
+            else
+            {
+                label_assignments++;
+                add_point_to_label(la);
+            }
+        }
+    }
+    const double scan_points_seconds = total_timer.elapsed() / 1000000.0;
+
+    _label_occurrence_count = label_counts;
+    _label_pair_edge_count.clear();
+
+    diskann::Timer inverted_timer;
+    rebuild_filter_inverted_index();
+    const double inverted_seconds = inverted_timer.elapsed() / 1000000.0;
+
+    // 中文说明：centroid 关系方式需要每个属性的质心；拓扑方式则不需要。
+    double centroid_seconds = 0.0;
+    if (_label_correlation_method == 1)
+    {
+        diskann::Timer centroid_timer;
+        compute_label_centroids();
+        centroid_seconds = centroid_timer.elapsed() / 1000000.0;
+    }
+    else
+    {
+        _label_centroids.clear();
+    }
+
+    const double total_seconds = total_timer.elapsed() / 1000000.0;
+    diskann::cout << "[timing] calculate_label_correlations total=" << total_seconds << "s"
+                  << " method=" << (_label_correlation_method == 1 ? "centroid" : "topo")
+                  << " scan_points=" << scan_points_seconds << "s"
+                  << " inverted_build=" << inverted_seconds << "s"
+                  << " centroid_build=" << centroid_seconds << "s"
+                  << " scanned_points=" << scanned_points
+                  << " label_assignments=" << label_assignments
+                  << " labels=" << _label_occurrence_count.size() << std::endl;
+}
+
+// 基于一跳图邻居属性共现次数，计算每个标签的 Top-K 相关标签列表（次数降序）
+template <typename T, typename TagT, typename LabelT> void Index<T, TagT, LabelT>::compute_top_k_label_correlations()
+{
+    _label_top_correlations.clear();
+    _label_correlation_matrix.clear();
+    if (_num_correlated_labels_to_expand == 0 || _label_occurrence_count.empty())
+        return;
+
+    std::vector<LabelT> all_labels;
+    all_labels.reserve(_label_occurrence_count.size());
+    for (const auto &kv : _label_occurrence_count)
+    {
+        if (kv.second > 0)
+        {
+            all_labels.emplace_back(kv.first);
+        }
+    }
+
+    diskann::Timer topk_timer;
+    // 中文说明：按构建参数选择关系计算方式。
+    const size_t related_events = (_label_correlation_method == 1)
+                                      ? recompute_label_top_correlations_by_centroid(all_labels)
+                                      : recompute_label_top_correlations(all_labels);
+    const double topk_seconds = topk_timer.elapsed() / 1000000.0;
+    diskann::cout << "[timing] compute_top_k_label_correlations total=" << topk_seconds << "s"
+                  << " method=" << (_label_correlation_method == 1 ? "centroid" : "topo")
+                  << " labels=" << all_labels.size()
+                  << " related_events=" << related_events << std::endl;
+}
+
+// 【新增实现 - 中文说明】基于新插入点的标签，标记需要增量刷新的标签
+template <typename T, typename TagT, typename LabelT>
+void Index<T, TagT, LabelT>::update_label_correlations_incremental(const std::vector<LabelT> &labels)
+{
+    if (_num_correlated_labels_to_expand == 0 || labels.empty())
+        return;
+    for (const auto &label : labels)
+    {
+        _dirty_labels.insert(label);
+    }
+}
+
+template <typename T, typename TagT, typename LabelT>
+bool Index<T, TagT, LabelT>::need_flush_pending_label_updates() const
+{
+    if (_location_to_labels.empty())
+    {
+        return false;
+    }
+    const uint64_t dynamic_threshold =
+        std::max<uint64_t>(1, static_cast<uint64_t>(std::ceil((double)_nd * (double)_filter_lazy_update_ratio)));
+    const uint64_t threshold = std::max<uint64_t>((uint64_t)_filter_lazy_update_min_ops, dynamic_threshold);
+    return _pending_label_update_ops.load(std::memory_order_relaxed) >= threshold;
+}
+
+template <typename T, typename TagT, typename LabelT>
+void Index<T, TagT, LabelT>::record_insert_label_updates(uint32_t location, const TagT tag, const T *point,
+                                                         const std::vector<LabelT> &labels)
+{
+    if (labels.empty())
+    {
+        return;
+    }
+
+    (void)point; // 中文说明：不再维护质心，point 暂不使用
+
+    for (const auto &label : labels)
+    {
+        _dirty_labels.insert(label);
+        _pending_label_occurrence_delta[label] += 1;
+
+        PendingLabelEvent event;
+        event.is_insert = true;
+        event.tag = tag;
+        event.location = location;
+        event.seq = ++_pending_event_seq;
+        _pending_new_label_events[label].emplace_back(event);
+
+        if (_enable_tags)
+        {
+            _label_to_active_tags[label].insert(tag);
+        }
+
+    }
+
+    _pending_label_update_ops.fetch_add(1, std::memory_order_relaxed);
+}
+
+template <typename T, typename TagT, typename LabelT>
+void Index<T, TagT, LabelT>::record_delete_label_updates(uint32_t location, const TagT tag)
+{
+    if (_location_to_labels.empty() || location >= _location_to_labels.size())
+    {
+        return;
+    }
+
+    const auto &labels = _location_to_labels[location];
+    if (labels.empty())
+    {
+        return;
+    }
+
+    for (const auto &label : labels)
+    {
+        _dirty_labels.insert(label);
+        _pending_label_occurrence_delta[label] -= 1;
+
+        PendingLabelEvent event;
+        event.is_insert = false;
+        event.tag = tag;
+        event.location = location;
+        event.seq = ++_pending_event_seq;
+        _pending_new_label_events[label].emplace_back(event);
+
+        if (_enable_tags)
+        {
+            auto it = _label_to_active_tags.find(label);
+            if (it != _label_to_active_tags.end())
+            {
+                it->second.erase(tag);
+            }
+        }
+    }
+
+    _pending_label_update_ops.fetch_add(1, std::memory_order_relaxed);
+}
+
+template <typename T, typename TagT, typename LabelT> void Index<T, TagT, LabelT>::refresh_dirty_label_medoids()
+{
+    for (const auto &label : _dirty_labels)
+    {
+        auto active_it = _label_to_active_tags.find(label);
+        if (active_it == _label_to_active_tags.end() || active_it->second.empty())
+        {
+            auto old_medoid_it = _label_to_start_id.find(label);
+            if (old_medoid_it != _label_to_start_id.end())
+            {
+                auto medoid_cnt_it = _medoid_counts.find(old_medoid_it->second);
+                if (medoid_cnt_it != _medoid_counts.end() && medoid_cnt_it->second > 0)
+                {
+                    medoid_cnt_it->second -= 1;
+                }
+                _label_to_start_id.erase(old_medoid_it);
+            }
+            continue;
+        }
+
+        uint32_t best_location = std::numeric_limits<uint32_t>::max();
+        uint32_t best_medoid_load = std::numeric_limits<uint32_t>::max();
+        for (const auto &active_tag : active_it->second)
+        {
+            auto loc_it = _tag_to_location.find(active_tag);
+            if (loc_it == _tag_to_location.end())
+            {
+                continue;
+            }
+            const uint32_t candidate = loc_it->second;
+            uint32_t cur_load = 0;
+            auto cnt_it = _medoid_counts.find(candidate);
+            if (cnt_it != _medoid_counts.end())
+            {
+                cur_load = cnt_it->second;
+            }
+            if (cur_load < best_medoid_load)
+            {
+                best_medoid_load = cur_load;
+                best_location = candidate;
+            }
+        }
+
+        if (best_location == std::numeric_limits<uint32_t>::max())
+        {
+            continue;
+        }
+
+        auto old_medoid_it = _label_to_start_id.find(label);
+        if (old_medoid_it != _label_to_start_id.end() && old_medoid_it->second != best_location)
+        {
+            auto cnt_it = _medoid_counts.find(old_medoid_it->second);
+            if (cnt_it != _medoid_counts.end() && cnt_it->second > 0)
+            {
+                cnt_it->second -= 1;
+            }
+            _label_to_start_id[label] = best_location;
+            _medoid_counts[best_location] += 1;
+        }
+        else if (old_medoid_it == _label_to_start_id.end())
+        {
+            _label_to_start_id[label] = best_location;
+            _medoid_counts[best_location] += 1;
+        }
+    }
+}
+
+template <typename T, typename TagT, typename LabelT> void Index<T, TagT, LabelT>::refresh_dirty_label_correlations()
+{
+    if (_num_correlated_labels_to_expand == 0 || _label_occurrence_count.empty())
+    {
+        return;
+    }
+
+    diskann::Timer total_timer;
+    tsl::robin_set<LabelT> affected_labels;
+    for (const auto &kv : _label_occurrence_count)
+    {
+        if (kv.second > 0)
+        {
+            affected_labels.insert(kv.first);
+        }
+    }
+
+    diskann::Timer ranking_timer;
+    std::vector<LabelT> affected_label_list;
+    affected_label_list.reserve(affected_labels.size());
+    for (const auto &label : affected_labels)
+    {
+        affected_label_list.emplace_back(label);
+    }
+    // 中文说明：图结构或标签变化会影响邻接共现/质心，动态批量刷新时重算所有活跃标签以保证一致性。
+    size_t related_events = 0;
+    if (_label_correlation_method == 1)
+    {
+        // centroid 方式：先按当前活跃向量重算质心，再基于质心距离重排。
+        compute_label_centroids();
+        related_events = recompute_label_top_correlations_by_centroid(affected_label_list);
+    }
+    else
+    {
+        related_events = recompute_label_top_correlations(affected_label_list);
+    }
+    const double ranking_seconds = ranking_timer.elapsed() / 1000000.0;
+    const double total_seconds = total_timer.elapsed() / 1000000.0;
+    diskann::cout << "[timing] refresh_dirty_label_correlations total=" << total_seconds << "s"
+                  << " method=" << (_label_correlation_method == 1 ? "centroid" : "topo")
+                  << " ranking=" << ranking_seconds << "s"
+                  << " dirty_labels=" << _dirty_labels.size()
+                  << " affected_labels=" << affected_labels.size()
+                  << " related_events=" << related_events
+                  << " ranked_labels=" << affected_label_list.size() << std::endl;
+}
+
+template <typename T, typename TagT, typename LabelT>
+void Index<T, TagT, LabelT>::flush_pending_label_updates(const bool force)
+{
+    if (_location_to_labels.empty())
+    {
+        return;
+    }
+
+    std::shared_lock<std::shared_timed_mutex> ul(_update_lock);
+    std::unique_lock<std::shared_timed_mutex> tl(_tag_lock);
+    std::unique_lock<std::shared_timed_mutex> dl(_delete_lock);
+
+    if (!force && !need_flush_pending_label_updates())
+    {
+        return;
+    }
+    if (_pending_label_update_ops.load(std::memory_order_relaxed) == 0)
+    {
+        return;
+    }
+
+    diskann::Timer total_timer;
+    const uint64_t pending_ops = _pending_label_update_ops.load(std::memory_order_relaxed);
+    const size_t dirty_label_count = _dirty_labels.size();
+    const size_t occ_delta_count = _pending_label_occurrence_delta.size();
+
+    // 中文说明：应用出现次数增量，维护关系矩阵所需的 label 出现计数（用于判断标签是否仍存在）。
+    diskann::Timer occ_timer;
+    for (const auto &kv : _pending_label_occurrence_delta)
+    {
+        const LabelT label = kv.first;
+        const int64_t delta = kv.second;
+        uint64_t cur_cnt = _label_occurrence_count[label];
+        int64_t next_cnt = (int64_t)cur_cnt + delta;
+        if (next_cnt < 0)
+        {
+            next_cnt = 0;
+        }
+        _label_occurrence_count[label] = (uint64_t)next_cnt;
+    }
+    const double occ_seconds = occ_timer.elapsed() / 1000000.0;
+
+    diskann::Timer medoid_timer;
+    refresh_dirty_label_medoids();
+    const double medoid_seconds = medoid_timer.elapsed() / 1000000.0;
+
+    diskann::Timer corr_timer;
+    refresh_dirty_label_correlations();
+    const double corr_seconds = corr_timer.elapsed() / 1000000.0;
+
+    // 批量更新完成后，释放新标签的临时事件缓存
+    diskann::Timer cleanup_timer;
+    for (const auto &label : _dirty_labels)
+    {
+        _pending_new_label_events.erase(label);
+        if (_label_occurrence_count[label] == 0)
+        {
+            _pending_new_labels.erase(label);
+        }
+        else if (_label_to_start_id.find(label) != _label_to_start_id.end())
+        {
+            _pending_new_labels.erase(label);
+        }
+    }
+    const double cleanup_seconds = cleanup_timer.elapsed() / 1000000.0;
+
+    _pending_label_occurrence_delta.clear();
+    _dirty_labels.clear();
+    _pending_label_update_ops.store(0, std::memory_order_relaxed);
+    const double total_seconds = total_timer.elapsed() / 1000000.0;
+    diskann::cout << "[timing] flush_pending_label_updates total=" << total_seconds << "s"
+                  << " pending_ops=" << pending_ops
+                  << " dirty_labels=" << dirty_label_count
+                  << " occ_delta_labels=" << occ_delta_count
+                  << " occ_apply=" << occ_seconds << "s"
+                  << " medoid=" << medoid_seconds << "s"
+                  << " correlation=" << corr_seconds << "s"
+                  << " cleanup=" << cleanup_seconds << "s" << std::endl;
+}
+
+template <typename T, typename TagT, typename LabelT>
+template <typename IdType>
+std::pair<uint32_t, uint32_t> Index<T, TagT, LabelT>::brute_force_search_pending_label(const T *query,
+                                                                                        const LabelT &filter_label,
+                                                                                        const size_t K, IdType *indices,
+                                                                                        float *distances,
+                                                                                        const bool return_tags,
+                                                                                        std::vector<T *> *res_vectors)
+{
+    std::shared_lock<std::shared_timed_mutex> tl(_tag_lock);
+
+    auto event_it = _pending_new_label_events.find(filter_label);
+    if (event_it == _pending_new_label_events.end() || event_it->second.empty())
+    {
+        return std::make_pair(0U, 0U);
+    }
+
+    ScratchStoreManager<InMemQueryScratch<T>> manager(_query_scratch);
+    auto scratch = manager.scratch_space();
+    _data_store->preprocess_query(query, scratch);
+    const T *aligned_query = scratch->aligned_query();
+
+    tsl::robin_set<TagT> deleted_tags;
+    tsl::robin_set<TagT> accepted_tags;
+    std::vector<Neighbor> candidates;
+    candidates.reserve(event_it->second.size());
+
+    for (auto rit = event_it->second.rbegin(); rit != event_it->second.rend(); ++rit)
+    {
+        if (!rit->is_insert)
+        {
+            deleted_tags.insert(rit->tag);
+            continue;
+        }
+        if (deleted_tags.find(rit->tag) != deleted_tags.end() || accepted_tags.find(rit->tag) != accepted_tags.end())
+        {
+            continue;
+        }
+
+        auto loc_it = _tag_to_location.find(rit->tag);
+        if (loc_it == _tag_to_location.end())
+        {
+            continue;
+        }
+        const uint32_t location = loc_it->second;
+        const float distance = _data_store->get_distance(aligned_query, location);
+        candidates.emplace_back(location, distance);
+        accepted_tags.insert(rit->tag);
+    }
+
+    std::sort(candidates.begin(), candidates.end());
+    size_t pos = 0;
+    for (size_t candidate_idx = 0; candidate_idx < candidates.size() && pos < K; candidate_idx++)
+    {
+        const uint32_t location = candidates[candidate_idx].id;
+        if (return_tags)
+        {
+            TagT tag{};
+            if (!_location_to_tag.try_get(location, tag))
+            {
+                continue;
+            }
+
+            if constexpr (std::is_same_v<IdType, TagT>)
+            {
+                indices[pos] = tag;
+            }
+            else if constexpr (std::is_arithmetic_v<IdType> && std::is_arithmetic_v<TagT>)
+            {
+                indices[pos] = static_cast<IdType>(tag);
+            }
+            else
+            {
+                continue;
+            }
+        }
+        else
+        {
+            if constexpr (std::is_arithmetic_v<IdType>)
+            {
+                indices[pos] = static_cast<IdType>(location);
+            }
+            else
+            {
+                continue;
+            }
+        }
+
+        if (res_vectors != nullptr && pos < res_vectors->size())
+        {
+            _data_store->get_vector(location, (*res_vectors)[pos]);
+        }
+
+        if (distances != nullptr)
+        {
+#ifdef EXEC_ENV_OLS
+            distances[pos] = candidates[candidate_idx].distance;
+#else
+            distances[pos] = _dist_metric == diskann::Metric::INNER_PRODUCT ? -1 * candidates[candidate_idx].distance
+                                                                            : candidates[candidate_idx].distance;
+#endif
+        }
+        pos++;
+    }
+
+    if (distances != nullptr)
+    {
+        for (size_t i = pos; i < K; i++)
+        {
+            distances[i] = std::numeric_limits<float>::infinity();
+        }
+    }
+    for (; pos < K; pos++)
+    {
+        indices[pos] = IdType{};
+    }
+
+    return std::make_pair((uint32_t)pos, (uint32_t)candidates.size());
 }
 
 template <typename T, typename TagT, typename LabelT>
@@ -1749,11 +2878,64 @@ void Index<T, TagT, LabelT>::build(const std::string &data_file, const size_t nu
                                    IndexFilterParams &filter_params)
 {
     size_t points_to_load = num_points_to_load == 0 ? _max_points : num_points_to_load;
+    auto build_with_default_tags = [&]() {
+        if (_enable_tags)
+        {
+            std::vector<TagT> default_tags(points_to_load);
+            for (size_t i = 0; i < points_to_load; ++i)
+            {
+                if constexpr (std::is_same_v<TagT, tag_uint128>)
+                {
+                    default_tags[i] = static_cast<uint64_t>(i + 1);
+                }
+                else
+                {
+                    default_tags[i] = static_cast<TagT>(i + 1);
+                }
+            }
+            this->build(data_file.c_str(), points_to_load, default_tags);
+        }
+        else
+        {
+            this->build(data_file.c_str(), points_to_load);
+        }
+    };
 
     auto s = std::chrono::high_resolution_clock::now();
     if (filter_params.label_file == "")
     {
-        this->build(data_file.c_str(), points_to_load);
+        build_with_default_tags();
+    }
+    else if (filter_params.post_build_label_processing)
+    {
+        // 【新增 - 中文说明】先建普通图，再加载标签并计算相关性
+        std::string labels_file_to_use = filter_params.save_path_prefix + "_label_formatted.txt";
+        std::string mem_labels_int_map_file = filter_params.save_path_prefix + "_labels_map.txt";
+        convert_labels_string_to_int(filter_params.label_file, labels_file_to_use, mem_labels_int_map_file,
+                                     filter_params.universal_label);
+        _label_map = load_label_map(mem_labels_int_map_file);
+        if (filter_params.universal_label != "")
+        {
+            LabelT unv_label_as_num = 0;
+            this->set_universal_label(unv_label_as_num);
+        }
+
+        build_with_default_tags();
+
+        size_t num_points_labels = 0;
+        parse_label_file(labels_file_to_use, num_points_labels);
+        assert(num_points_labels == points_to_load);
+        if (_dynamic_index && _location_to_labels.size() < _max_points + _num_frozen_pts)
+        {
+            _location_to_labels.resize(_max_points + _num_frozen_pts);
+        }
+        prepare_label_metadata(points_to_load);
+
+        if (_num_correlated_labels_to_expand > 0)
+        {
+            calculate_label_correlations();
+            compute_top_k_label_correlations();
+        }
     }
     else
     {
@@ -1762,6 +2944,7 @@ void Index<T, TagT, LabelT>::build(const std::string &data_file, const size_t nu
         std::string mem_labels_int_map_file = filter_params.save_path_prefix + "_labels_map.txt";
         convert_labels_string_to_int(filter_params.label_file, labels_file_to_use, mem_labels_int_map_file,
                                      filter_params.universal_label);
+        _label_map = load_label_map(mem_labels_int_map_file);
         if (filter_params.universal_label != "")
         {
             LabelT unv_label_as_num = 0;
@@ -1769,6 +2952,32 @@ void Index<T, TagT, LabelT>::build(const std::string &data_file, const size_t nu
         }
         this->build_filtered_index(data_file.c_str(), labels_file_to_use, points_to_load);
     }
+
+    rebuild_filter_inverted_index();
+    if (!_location_to_labels.empty() && _enable_tags)
+    {
+        _label_to_active_tags.clear();
+        for (const auto &kv : _tag_to_location)
+        {
+            const TagT tag = kv.first;
+            const uint32_t loc = kv.second;
+            if (loc >= _location_to_labels.size())
+            {
+                continue;
+            }
+            for (const auto &label : _location_to_labels[loc])
+            {
+                _label_to_active_tags[label].insert(tag);
+            }
+        }
+    }
+    _dirty_labels.clear();
+    _pending_label_occurrence_delta.clear();
+    _pending_new_labels.clear();
+    _pending_new_label_events.clear();
+    _pending_event_seq = 0;
+    _pending_label_update_ops.store(0, std::memory_order_relaxed);
+
     std::chrono::duration<double> diff = std::chrono::high_resolution_clock::now() - s;
     std::cout << "Indexing time: " << diff.count() << "\n";
 }
@@ -1794,11 +3003,12 @@ std::unordered_map<std::string, LabelT> Index<T, TagT, LabelT>::load_label_map(c
 }
 
 template <typename T, typename TagT, typename LabelT>
-LabelT Index<T, TagT, LabelT>::get_converted_label(const std::string &raw_label)
+LabelT Index<T, TagT, LabelT>::get_converted_label(const std::string &raw_label) const
 {
-    if (_label_map.find(raw_label) != _label_map.end())
+    auto it = _label_map.find(raw_label);
+    if (it != _label_map.end())
     {
-        return _label_map[raw_label];
+        return it->second;
     }
     if (_use_universal_label)
     {
@@ -1808,6 +3018,196 @@ LabelT Index<T, TagT, LabelT>::get_converted_label(const std::string &raw_label)
     stream << "Unable to find label in the Label Map";
     diskann::cerr << stream.str() << std::endl;
     throw diskann::ANNException(stream.str(), -1, __FUNCSIG__, __FILE__, __LINE__);
+}
+
+template <typename T, typename TagT, typename LabelT>
+bool Index<T, TagT, LabelT>::try_convert_label(const std::string &raw_label, LabelT &label) const
+{
+    auto it = _label_map.find(raw_label);
+    if (it != _label_map.end())
+    {
+        label = it->second;
+        return true;
+    }
+
+    try
+    {
+        label = (LabelT)std::stoull(raw_label);
+        return true;
+    }
+    catch (const std::exception &)
+    {
+    }
+
+    if (_use_universal_label)
+    {
+        label = _universal_label;
+        return true;
+    }
+    return false;
+}
+
+template <typename T, typename TagT, typename LabelT>
+std::vector<LabelT>
+Index<T, TagT, LabelT>::convert_filter_labels(const std::vector<std::string> &raw_filter_labels) const
+{
+    std::vector<LabelT> converted_labels;
+    converted_labels.reserve(raw_filter_labels.size());
+    for (const auto &raw_label : raw_filter_labels)
+    {
+        LabelT label{};
+        if (try_convert_label(raw_label, label))
+        {
+            converted_labels.emplace_back(label);
+        }
+    }
+
+    std::sort(converted_labels.begin(), converted_labels.end());
+    converted_labels.erase(std::unique(converted_labels.begin(), converted_labels.end()), converted_labels.end());
+    return converted_labels;
+}
+
+template <typename T, typename TagT, typename LabelT>
+std::vector<LabelT> Index<T, TagT, LabelT>::build_expanded_filter_labels(const std::vector<LabelT> &base_labels,
+                                                                         int expand_num) const
+{
+    std::vector<LabelT> filter_labels = base_labels;
+    int effective_expand_num = expand_num;
+    if (effective_expand_num < 0)
+    {
+        effective_expand_num = static_cast<int>(_num_correlated_labels_to_expand);
+    }
+
+    if (effective_expand_num > 0 && _num_correlated_labels_to_expand > 0)
+    {
+        for (const auto &label : base_labels)
+        {
+            auto it = _label_top_correlations.find(label);
+            if (it == _label_top_correlations.end())
+            {
+                continue;
+            }
+
+            const size_t take_n = std::min(static_cast<size_t>(effective_expand_num), it->second.size());
+            for (size_t i = 0; i < take_n; i++)
+            {
+                filter_labels.emplace_back(it->second[i].second);
+            }
+        }
+        std::sort(filter_labels.begin(), filter_labels.end());
+        filter_labels.erase(std::unique(filter_labels.begin(), filter_labels.end()), filter_labels.end());
+    }
+
+    return filter_labels;
+}
+
+template <typename T, typename TagT, typename LabelT>
+void Index<T, TagT, LabelT>::add_location_to_filter_inverted_index(uint32_t location, const std::vector<LabelT> &labels)
+{
+    if (location >= _max_points || labels.empty())
+    {
+        return;
+    }
+
+    for (const auto &label : labels)
+    {
+        _filter_inverted_index[label].insert(location);
+    }
+}
+
+template <typename T, typename TagT, typename LabelT>
+void Index<T, TagT, LabelT>::remove_location_from_filter_inverted_index(uint32_t location,
+                                                                        const std::vector<LabelT> &labels)
+{
+    if (location >= _max_points || labels.empty())
+    {
+        return;
+    }
+
+    for (const auto &label : labels)
+    {
+        auto it = _filter_inverted_index.find(label);
+        if (it == _filter_inverted_index.end())
+        {
+            continue;
+        }
+        it->second.erase(location);
+        if (it->second.empty())
+        {
+            _filter_inverted_index.erase(it);
+        }
+    }
+}
+
+template <typename T, typename TagT, typename LabelT> void Index<T, TagT, LabelT>::rebuild_filter_inverted_index()
+{
+    _filter_inverted_index.clear();
+    if (_location_to_labels.empty())
+    {
+        return;
+    }
+
+    if (_enable_tags)
+    {
+        for (const auto &kv : _tag_to_location)
+        {
+            const uint32_t location = kv.second;
+            if (location >= _location_to_labels.size() || location >= _max_points)
+            {
+                continue;
+            }
+            add_location_to_filter_inverted_index(location, _location_to_labels[location]);
+        }
+        return;
+    }
+
+    const uint32_t max_live_location = static_cast<uint32_t>(std::min(_location_to_labels.size(), _max_points));
+    const bool has_empty_slots = !_empty_slots.is_empty();
+    for (uint32_t location = 0; location < max_live_location; location++)
+    {
+        // 中文说明：静态普通建图没有空槽，避免在空 bitset 上测试 location 导致越界。
+        if (has_empty_slots && _empty_slots.is_in_set(location))
+        {
+            continue;
+        }
+        if (_delete_set != nullptr && _delete_set->find(location) != _delete_set->end())
+        {
+            continue;
+        }
+        add_location_to_filter_inverted_index(location, _location_to_labels[location]);
+    }
+}
+
+template <typename T, typename TagT, typename LabelT>
+void Index<T, TagT, LabelT>::collect_bruteforce_filter_candidates(const LabelT &filter_label,
+                                                                  std::vector<uint32_t> &candidate_locations) const
+{
+    candidate_locations.clear();
+    tsl::robin_set<uint32_t> unique_locations;
+
+    auto append_posting = [this, &unique_locations](const LabelT &label) {
+        auto it = _filter_inverted_index.find(label);
+        if (it == _filter_inverted_index.end())
+        {
+            return;
+        }
+        for (const auto &location : it->second)
+        {
+            unique_locations.insert(location);
+        }
+    };
+
+    append_posting(filter_label);
+    if (_use_universal_label && filter_label != _universal_label)
+    {
+        append_posting(_universal_label);
+    }
+
+    candidate_locations.reserve(unique_locations.size());
+    for (const auto &location : unique_locations)
+    {
+        candidate_locations.emplace_back(location);
+    }
 }
 
 template <typename T, typename TagT, typename LabelT>
@@ -1858,32 +3258,12 @@ void Index<T, TagT, LabelT>::parse_label_file(const std::string &label_file, siz
 }
 
 template <typename T, typename TagT, typename LabelT>
-void Index<T, TagT, LabelT>::_set_universal_label(const LabelType universal_label)
+void Index<T, TagT, LabelT>::prepare_label_metadata(const size_t num_points_to_load)
 {
-    this->set_universal_label(std::any_cast<const LabelT>(universal_label));
-}
-
-template <typename T, typename TagT, typename LabelT>
-void Index<T, TagT, LabelT>::set_universal_label(const LabelT &label)
-{
-    _use_universal_label = true;
-    _universal_label = label;
-}
-
-template <typename T, typename TagT, typename LabelT>
-void Index<T, TagT, LabelT>::build_filtered_index(const char *filename, const std::string &label_file,
-                                                  const size_t num_points_to_load, const std::vector<TagT> &tags)
-{
-    _filtered_index = true;
     _label_to_start_id.clear();
-    size_t num_points_labels = 0;
-
-    parse_label_file(label_file,
-                     num_points_labels); // determines medoid for each label and identifies
-                                         // the points to label mapping
+    _medoid_counts.clear();
 
     std::unordered_map<LabelT, std::vector<uint32_t>> label_to_points;
-
     for (uint32_t point_id = 0; point_id < num_points_to_load; point_id++)
     {
         for (auto label : _location_to_labels[point_id])
@@ -1910,8 +3290,12 @@ void Index<T, TagT, LabelT>::build_filtered_index(const char *filename, const st
     {
         uint32_t best_medoid_count = std::numeric_limits<uint32_t>::max();
         auto &curr_label = *itr;
-        uint32_t best_medoid;
+        uint32_t best_medoid = 0;
         auto labeled_points = label_to_points[curr_label];
+        if (labeled_points.empty())
+        {
+            continue;
+        }
         for (uint32_t cnd = 0; cnd < num_cands; cnd++)
         {
             uint32_t cur_cnd = labeled_points[rand() % labeled_points.size()];
@@ -1934,8 +3318,48 @@ void Index<T, TagT, LabelT>::build_filtered_index(const char *filename, const st
         _label_to_start_id[curr_label] = best_medoid;
         _medoid_counts[best_medoid]++;
     }
+}
+
+template <typename T, typename TagT, typename LabelT>
+void Index<T, TagT, LabelT>::_set_universal_label(const LabelType universal_label)
+{
+    this->set_universal_label(std::any_cast<const LabelT>(universal_label));
+}
+
+template <typename T, typename TagT, typename LabelT>
+void Index<T, TagT, LabelT>::set_universal_label(const LabelT &label)
+{
+    _use_universal_label = true;
+    _universal_label = label;
+}
+
+template <typename T, typename TagT, typename LabelT>
+void Index<T, TagT, LabelT>::build_filtered_index(const char *filename, const std::string &label_file,
+                                                  const size_t num_points_to_load, const std::vector<TagT> &tags)
+{
+    _filtered_index = true;
+    size_t num_points_labels = 0;
+
+    parse_label_file(label_file,
+                     num_points_labels); // determines medoid for each label and identifies
+                                         // the points to label mapping
+    if (_dynamic_index && _location_to_labels.size() < _max_points + _num_frozen_pts)
+    {
+        _location_to_labels.resize(_max_points + _num_frozen_pts);
+    }
+
+    prepare_label_metadata(num_points_to_load);
+
+    std::cout << "ok checked" << std::endl;
 
     this->build(filename, num_points_to_load, tags);
+
+    // 【修改调用 - 中文说明】相关性改为“剪枝后图”统计，因此在 build() 完成后再计算
+    if (_num_correlated_labels_to_expand > 0)
+    {
+        calculate_label_correlations();
+        compute_top_k_label_correlations();
+    }
 }
 
 template <typename T, typename TagT, typename LabelT>
@@ -1992,7 +3416,7 @@ std::pair<uint32_t, uint32_t> Index<T, TagT, LabelT>::search(const T *query, con
     }
 
     const std::vector<LabelT> unused_filter_label;
-    const std::vector<uint32_t> init_ids = get_init_ids();
+    std::vector<uint32_t> init_ids = get_init_ids();
 
     std::shared_lock<std::shared_timed_mutex> lock(_update_lock);
 
@@ -2036,19 +3460,67 @@ std::pair<uint32_t, uint32_t> Index<T, TagT, LabelT>::search(const T *query, con
 template <typename T, typename TagT, typename LabelT>
 std::pair<uint32_t, uint32_t> Index<T, TagT, LabelT>::_search_with_filters(const DataType &query,
                                                                            const std::string &raw_label, const size_t K,
-                                                                           const uint32_t L, std::any &indices,
+                                                                           const uint32_t L, const int expand_num,
+                                                                           std::any &indices,
                                                                            float *distances)
 {
-    auto converted_label = this->get_converted_label(raw_label);
+    LabelT converted_label{};
+    bool has_label = false;
+    try
+    {
+        converted_label = this->get_converted_label(raw_label);
+        has_label = true;
+    }
+    catch (const std::exception &)
+    {
+        try
+        {
+            converted_label = (LabelT)std::stoull(raw_label);
+            has_label = true;
+        }
+        catch (const std::exception &)
+        {
+            has_label = false;
+        }
+    }
+
+    if (!has_label)
+    {
+        throw ANNException("Error: Unable to find or parse filter label.", -1);
+    }
+
+    bool use_pending_bruteforce = false;
+    {
+        std::shared_lock<std::shared_timed_mutex> tl(_tag_lock);
+        use_pending_bruteforce = _pending_new_labels.find(converted_label) != _pending_new_labels.end();
+    }
+    if (use_pending_bruteforce)
+    {
+        if (typeid(uint64_t *) == indices.type())
+        {
+            auto ptr = std::any_cast<uint64_t *>(indices);
+            return this->brute_force_search_pending_label(std::any_cast<const T *>(query), converted_label, K, ptr,
+                                                          distances);
+        }
+        else if (typeid(uint32_t *) == indices.type())
+        {
+            auto ptr = std::any_cast<uint32_t *>(indices);
+            return this->brute_force_search_pending_label(std::any_cast<const T *>(query), converted_label, K, ptr,
+                                                          distances);
+        }
+    }
+
     if (typeid(uint64_t *) == indices.type())
     {
         auto ptr = std::any_cast<uint64_t *>(indices);
-        return this->search_with_filters(std::any_cast<T *>(query), converted_label, K, L, ptr, distances);
+        return this->search_with_filters(std::any_cast<const T *>(query), converted_label, K, L, ptr, distances,
+                                         expand_num);
     }
     else if (typeid(uint32_t *) == indices.type())
     {
         auto ptr = std::any_cast<uint32_t *>(indices);
-        return this->search_with_filters(std::any_cast<T *>(query), converted_label, K, L, ptr, distances);
+        return this->search_with_filters(std::any_cast<const T *>(query), converted_label, K, L, ptr, distances,
+                                         expand_num);
     }
     else
     {
@@ -2060,11 +3532,22 @@ template <typename T, typename TagT, typename LabelT>
 template <typename IdType>
 std::pair<uint32_t, uint32_t> Index<T, TagT, LabelT>::search_with_filters(const T *query, const LabelT &filter_label,
                                                                           const size_t K, const uint32_t L,
-                                                                          IdType *indices, float *distances)
+                                                                          IdType *indices, float *distances,
+                                                                          const int expand_num)
 {
     if (K > (uint64_t)L)
     {
         throw ANNException("Set L to a value of at least K", -1, __FUNCSIG__, __FILE__, __LINE__);
+    }
+
+    bool use_pending_bruteforce = false;
+    {
+        std::shared_lock<std::shared_timed_mutex> tl(_tag_lock);
+        use_pending_bruteforce = _pending_new_labels.find(filter_label) != _pending_new_labels.end();
+    }
+    if (use_pending_bruteforce)
+    {
+        return brute_force_search_pending_label(query, filter_label, K, indices, distances);
     }
 
     ScratchStoreManager<InMemQueryScratch<T>> manager(_query_scratch);
@@ -2100,7 +3583,38 @@ std::pair<uint32_t, uint32_t> Index<T, TagT, LabelT>::search_with_filters(const 
         tl.unlock();
 
     filter_vec.emplace_back(filter_label);
+    // 查询阶段：根据相关性扩展标签集合（OR逻辑）
+    // cout<<_num_correlated_labels_to_expand<<std::endl;
 
+    int num = 0;
+
+    // std:;cout<<_label_top_correlations.size()<<std::endl;
+
+    int effective_expand_num = expand_num;
+    if (effective_expand_num < 0)
+    {
+        // 兼容旧默认行为：不显式指定时，使用索引内配置的扩展数量
+        effective_expand_num = static_cast<int>(_num_correlated_labels_to_expand);
+    }
+
+    if (effective_expand_num > 0 && _num_correlated_labels_to_expand > 0)
+    {
+        auto it = _label_top_correlations.find(filter_label);
+        if (it != _label_top_correlations.end())
+        {
+            const size_t take_n = std::min(static_cast<size_t>(effective_expand_num), it->second.size());
+            for (size_t i = 0; i < take_n; i++)
+            {
+                // it->second 已按一跳图邻居属性共现次数从高到低排序（compute_top_k_label_correlations 生成）
+                filter_vec.emplace_back(it->second[i].second);
+                num++;
+            }
+            // 去重
+            std::sort(filter_vec.begin(), filter_vec.end());
+            filter_vec.erase(std::unique(filter_vec.begin(), filter_vec.end()), filter_vec.end());
+        }
+    }
+    // std::cout<<"num: "<<num<<std::endl;
     _data_store->preprocess_query(query, scratch);
     auto retval = iterate_to_fixed_point(scratch, L, init_ids, true, filter_vec, true);
 
@@ -2111,6 +3625,13 @@ std::pair<uint32_t, uint32_t> Index<T, TagT, LabelT>::search_with_filters(const 
     {
         if (best_L_nodes[i].id < _max_points)
         {
+            const auto &node_labels = _location_to_labels[best_L_nodes[i].id];
+
+            if (std::find(node_labels.begin(), node_labels.end(), filter_label) == node_labels.end())
+            {
+                continue;
+            }
+
             indices[pos] = (IdType)best_L_nodes[i].id;
 
             if (distances != nullptr)
@@ -2130,21 +3651,398 @@ std::pair<uint32_t, uint32_t> Index<T, TagT, LabelT>::search_with_filters(const 
     }
     if (pos < K)
     {
-        diskann::cerr << "Found fewer than K elements for query" << std::endl;
+        // diskann::cerr << "Found fewer than K elements for query" << std::endl;
     }
 
     return retval;
 }
 
 template <typename T, typename TagT, typename LabelT>
+std::pair<uint32_t, uint32_t>
+Index<T, TagT, LabelT>::search_with_filter_label_group(const T *query,
+                                                       const std::vector<std::string> &raw_filter_labels,
+                                                       const size_t K, const uint32_t L, uint32_t *indices,
+                                                       float *distances, const int expand_num,
+                                                       const bool include_unfiltered_starts,
+                                                       const std::vector<uint32_t> *probe_seed_ids)
+{
+    if (K > (uint64_t)L)
+    {
+        throw ANNException("Set L to a value of at least K", -1, __FUNCSIG__, __FILE__, __LINE__);
+    }
+
+    const std::vector<LabelT> base_labels = convert_filter_labels(raw_filter_labels);
+    if (base_labels.empty())
+    {
+        for (size_t i = 0; i < K; i++)
+        {
+            indices[i] = 0;
+            if (distances != nullptr)
+            {
+                distances[i] = std::numeric_limits<float>::infinity();
+            }
+        }
+        return std::make_pair(0U, 0U);
+    }
+
+    ScratchStoreManager<InMemQueryScratch<T>> manager(_query_scratch);
+    auto scratch = manager.scratch_space();
+
+    if (L > scratch->get_L())
+    {
+        diskann::cout << "Attempting to expand query scratch_space. Was created "
+                      << "with Lsize: " << scratch->get_L() << " but search L is: " << L << std::endl;
+        scratch->resize_for_new_L(L);
+        diskann::cout << "Resize completed. New scratch->L is " << scratch->get_L() << std::endl;
+    }
+
+    std::vector<uint32_t> init_ids = include_unfiltered_starts ? get_init_ids() : std::vector<uint32_t>();
+    const std::vector<LabelT> filter_labels = build_expanded_filter_labels(base_labels, expand_num);
+    const uint32_t max_points = _max_points;
+
+    auto push_unique_start = [&init_ids, max_points](uint32_t id) {
+        if (id >= max_points)
+        {
+            return;
+        }
+        if (std::find(init_ids.begin(), init_ids.end(), id) == init_ids.end())
+        {
+            init_ids.emplace_back(id);
+        }
+    };
+
+    if (probe_seed_ids != nullptr)
+    {
+        for (const uint32_t id : *probe_seed_ids)
+        {
+            push_unique_start(id);
+        }
+
+        const size_t target_start_count = base_labels.size();
+        if (init_ids.size() < target_start_count)
+        {
+            std::shared_lock<std::shared_timed_mutex> tl(_tag_lock);
+            for (const auto &label : base_labels)
+            {
+                if (init_ids.size() >= target_start_count)
+                {
+                    break;
+                }
+                auto it = _label_to_start_id.find(label);
+                if (it == _label_to_start_id.end())
+                {
+                    continue;
+                }
+                push_unique_start(it->second);
+            }
+        }
+    }
+    else
+    {
+        std::shared_lock<std::shared_timed_mutex> tl(_tag_lock);
+        for (const auto &label : base_labels)
+        {
+            auto it = _label_to_start_id.find(label);
+            if (it == _label_to_start_id.end())
+            {
+                continue;
+            }
+            push_unique_start(it->second);
+        }
+    }
+
+    if (init_ids.empty())
+    {
+        throw diskann::ANNException("No filtered medoid found. exitting ", -1);
+    }
+
+    std::shared_lock<std::shared_timed_mutex> ul(_update_lock);
+    _data_store->preprocess_query(query, scratch);
+    auto retval = iterate_to_fixed_point(scratch, L, init_ids, true, filter_labels, true);
+
+    auto best_L_nodes = scratch->best_l_nodes();
+    size_t pos = 0;
+    for (size_t i = 0; i < best_L_nodes.size() && pos < K; ++i)
+    {
+        const uint32_t location = best_L_nodes[i].id;
+        if (location >= _max_points)
+        {
+            continue;
+        }
+        if (!detect_common_filters(location, true, base_labels))
+        {
+            continue;
+        }
+
+        indices[pos] = location;
+        if (distances != nullptr)
+        {
+#ifdef EXEC_ENV_OLS
+            distances[pos] = best_L_nodes[i].distance;
+#else
+            distances[pos] = _dist_metric == diskann::Metric::INNER_PRODUCT ? -1 * best_L_nodes[i].distance
+                                                                            : best_L_nodes[i].distance;
+#endif
+        }
+        pos++;
+    }
+
+    for (size_t i = pos; i < K; i++)
+    {
+        indices[i] = 0;
+        if (distances != nullptr)
+        {
+            distances[i] = std::numeric_limits<float>::infinity();
+        }
+    }
+
+    return std::make_pair(static_cast<uint32_t>(pos), retval.second);
+}
+
+template <typename T, typename TagT, typename LabelT>
+std::tuple<double, uint32_t, std::vector<uint32_t>> Index<T, TagT, LabelT>::probe_filter_label_group_valid_ratio(
+    const T *query, const std::vector<std::string> &raw_filter_labels, const uint32_t L)
+{
+    const std::vector<LabelT> base_labels = convert_filter_labels(raw_filter_labels);
+    if (base_labels.empty())
+    {
+        return {0.0, 0U, {}};
+    }
+
+    ScratchStoreManager<InMemQueryScratch<T>> manager(_query_scratch);
+    auto scratch = manager.scratch_space();
+
+    if (L > scratch->get_L())
+    {
+        diskann::cout << "Attempting to expand query scratch_space. Was created "
+                      << "with Lsize: " << scratch->get_L() << " but probe L is: " << L << std::endl;
+        scratch->resize_for_new_L(L);
+        diskann::cout << "Resize completed. New scratch->L is " << scratch->get_L() << std::endl;
+    }
+
+    std::vector<uint32_t> init_ids;
+    size_t medoid_count = 0;
+    {
+        std::shared_lock<std::shared_timed_mutex> tl(_tag_lock);
+        auto push_unique = [&init_ids](uint32_t id) {
+            if (std::find(init_ids.begin(), init_ids.end(), id) == init_ids.end())
+            {
+                init_ids.emplace_back(id);
+            }
+        };
+
+        for (const auto &label : base_labels)
+        {
+            auto it = _label_to_start_id.find(label);
+            if (it == _label_to_start_id.end())
+            {
+                continue;
+            }
+            push_unique(it->second);
+            medoid_count++;
+        }
+    }
+
+    if (medoid_count == 0)
+    {
+        return {0.0, 0U, {}};
+    }
+
+    const std::vector<LabelT> empty_filter_labels;
+    std::shared_lock<std::shared_timed_mutex> ul(_update_lock);
+    _data_store->preprocess_query(query, scratch);
+    auto retval = iterate_to_fixed_point(scratch, L, init_ids, false, empty_filter_labels, true);
+
+    const auto &best_L_nodes = scratch->best_l_nodes();
+    uint32_t candidate_count = 0;
+    uint32_t valid_count = 0;
+    std::vector<uint32_t> valid_seed_ids;
+    valid_seed_ids.reserve(best_L_nodes.size());
+    for (size_t i = 0; i < best_L_nodes.size(); ++i)
+    {
+        const uint32_t loc = best_L_nodes[i].id;
+        if (loc >= _max_points)
+        {
+            continue;
+        }
+        candidate_count++;
+        if (detect_common_filters(loc, true, base_labels))
+        {
+            valid_count++;
+            valid_seed_ids.push_back(loc);
+        }
+    }
+
+    const double R = candidate_count == 0 ? 0.0 : static_cast<double>(valid_count) / static_cast<double>(candidate_count);
+    return {R, retval.second, std::move(valid_seed_ids)};
+}
+
+template <typename T, typename TagT, typename LabelT>
+std::pair<size_t, uint32_t>
+Index<T, TagT, LabelT>::search_with_filter_label_group_tags(const T *query, const uint64_t K, const uint32_t L,
+                                                            TagT *tags, float *distances,
+                                                            std::vector<T *> &res_vectors,
+                                                            const std::vector<std::string> &raw_filter_labels,
+                                                            const int expand_num,
+                                                            const bool include_unfiltered_starts,
+                                                            const std::vector<uint32_t> *probe_seed_ids)
+{
+    std::vector<uint32_t> locations(K, 0);
+    auto retval = search_with_filter_label_group(query, raw_filter_labels, static_cast<size_t>(K), L, locations.data(),
+                                                 distances, expand_num, include_unfiltered_starts, probe_seed_ids);
+
+    size_t pos = 0;
+    std::shared_lock<std::shared_timed_mutex> tl(_tag_lock);
+    for (size_t i = 0; i < retval.first; i++)
+    {
+        TagT tag{};
+        if (!_location_to_tag.try_get(locations[i], tag))
+        {
+            continue;
+        }
+
+        tags[pos] = tag;
+        if (distances != nullptr && pos != i)
+        {
+            distances[pos] = distances[i];
+        }
+        if (pos < res_vectors.size())
+        {
+            _data_store->get_vector(locations[i], res_vectors[pos]);
+        }
+        pos++;
+    }
+
+    for (size_t i = pos; i < K; i++)
+    {
+        tags[i] = TagT{};
+        if (distances != nullptr)
+        {
+            distances[i] = std::numeric_limits<float>::infinity();
+        }
+    }
+    return std::make_pair(pos, retval.second);
+}
+
+template <typename T, typename TagT, typename LabelT>
+std::pair<uint32_t, uint32_t>
+Index<T, TagT, LabelT>::brute_force_search_filter_label(const T *query, const std::string &raw_filter_label,
+                                                        const size_t K, uint32_t *indices, float *distances)
+{
+    LabelT filter_label{};
+    if (!try_convert_label(raw_filter_label, filter_label))
+    {
+        for (size_t i = 0; i < K; i++)
+        {
+            indices[i] = 0;
+            if (distances != nullptr)
+            {
+                distances[i] = std::numeric_limits<float>::infinity();
+            }
+        }
+        return std::make_pair(0U, 0U);
+    }
+
+    ScratchStoreManager<InMemQueryScratch<T>> manager(_query_scratch);
+    auto scratch = manager.scratch_space();
+    std::shared_lock<std::shared_timed_mutex> ul(_update_lock);
+    _data_store->preprocess_query(query, scratch);
+    const T *aligned_query = scratch->aligned_query();
+
+    std::vector<uint32_t> candidate_locations;
+    {
+        std::shared_lock<std::shared_timed_mutex> tl(_tag_lock);
+        collect_bruteforce_filter_candidates(filter_label, candidate_locations);
+    }
+
+    std::vector<Neighbor> candidates;
+    candidates.reserve(candidate_locations.size());
+    for (const auto &location : candidate_locations)
+    {
+        candidates.emplace_back(location, _data_store->get_distance(aligned_query, location));
+    }
+    std::sort(candidates.begin(), candidates.end());
+
+    size_t pos = 0;
+    for (size_t i = 0; i < candidates.size() && pos < K; i++)
+    {
+        indices[pos] = candidates[i].id;
+        if (distances != nullptr)
+        {
+#ifdef EXEC_ENV_OLS
+            distances[pos] = candidates[i].distance;
+#else
+            distances[pos] =
+                _dist_metric == diskann::Metric::INNER_PRODUCT ? -1 * candidates[i].distance : candidates[i].distance;
+#endif
+        }
+        pos++;
+    }
+
+    for (size_t i = pos; i < K; i++)
+    {
+        indices[i] = 0;
+        if (distances != nullptr)
+        {
+            distances[i] = std::numeric_limits<float>::infinity();
+        }
+    }
+
+    return std::make_pair(static_cast<uint32_t>(pos), static_cast<uint32_t>(candidate_locations.size()));
+}
+
+template <typename T, typename TagT, typename LabelT>
+std::pair<size_t, uint32_t>
+Index<T, TagT, LabelT>::brute_force_search_filter_label_tags(const T *query, const std::string &raw_filter_label,
+                                                             const uint64_t K, TagT *tags, float *distances,
+                                                             std::vector<T *> &res_vectors)
+{
+    std::vector<uint32_t> locations(K, 0);
+    auto retval = brute_force_search_filter_label(query, raw_filter_label, static_cast<size_t>(K), locations.data(),
+                                                  distances);
+
+    size_t pos = 0;
+    std::shared_lock<std::shared_timed_mutex> tl(_tag_lock);
+    for (size_t i = 0; i < retval.first; i++)
+    {
+        TagT tag{};
+        if (!_location_to_tag.try_get(locations[i], tag))
+        {
+            continue;
+        }
+
+        tags[pos] = tag;
+        if (distances != nullptr && pos != i)
+        {
+            distances[pos] = distances[i];
+        }
+        if (pos < res_vectors.size())
+        {
+            _data_store->get_vector(locations[i], res_vectors[pos]);
+        }
+        pos++;
+    }
+
+    for (size_t i = pos; i < K; i++)
+    {
+        tags[i] = TagT{};
+        if (distances != nullptr)
+        {
+            distances[i] = std::numeric_limits<float>::infinity();
+        }
+    }
+    return std::make_pair(pos, retval.second);
+}
+
+template <typename T, typename TagT, typename LabelT>
 size_t Index<T, TagT, LabelT>::_search_with_tags(const DataType &query, const uint64_t K, const uint32_t L,
                                                  const TagType &tags, float *distances, DataVector &res_vectors,
-                                                 bool use_filters, const std::string filter_label)
+                                                 bool use_filters, const std::string filter_label, const int expand_num)
 {
     try
     {
         return this->search_with_tags(std::any_cast<const T *>(query), K, L, std::any_cast<TagT *>(tags), distances,
-                                      res_vectors.get<std::vector<T *>>(), use_filters, filter_label);
+                                      res_vectors.get<std::vector<T *>>(), use_filters, filter_label, expand_num);
     }
     catch (const std::bad_any_cast &e)
     {
@@ -2159,12 +4057,57 @@ size_t Index<T, TagT, LabelT>::_search_with_tags(const DataType &query, const ui
 template <typename T, typename TagT, typename LabelT>
 size_t Index<T, TagT, LabelT>::search_with_tags(const T *query, const uint64_t K, const uint32_t L, TagT *tags,
                                                 float *distances, std::vector<T *> &res_vectors, bool use_filters,
-                                                const std::string filter_label)
+                                                const std::string filter_label, const int expand_num)
 {
     if (K > (uint64_t)L)
     {
         throw ANNException("Set L to a value of at least K", -1, __FUNCSIG__, __FILE__, __LINE__);
     }
+
+    LabelT converted_label{};
+    bool has_label = false;
+    bool use_pending_bruteforce = false;
+    int effective_expand_num = expand_num;
+    if (use_filters)
+    {
+        try
+        {
+            converted_label = this->get_converted_label(filter_label);
+            has_label = true;
+        }
+        catch (const std::exception &)
+        {
+            try
+            {
+                converted_label = (LabelT)std::stoull(filter_label);
+                has_label = true;
+            }
+            catch (const std::exception &)
+            {
+                has_label = false;
+            }
+        }
+
+        if (!has_label)
+        {
+            throw ANNException("Error: Unable to find or parse filter label.", -1);
+        }
+
+        {
+            std::shared_lock<std::shared_timed_mutex> tl(_tag_lock);
+            use_pending_bruteforce = _pending_new_labels.find(converted_label) != _pending_new_labels.end();
+        }
+        if (use_pending_bruteforce)
+        {
+            return brute_force_search_pending_label(query, converted_label, K, tags, distances, true, &res_vectors).first;
+        }
+
+        if (effective_expand_num < 0)
+        {
+            effective_expand_num = static_cast<int>(_num_correlated_labels_to_expand);
+        }
+    }
+
     ScratchStoreManager<InMemQueryScratch<T>> manager(_query_scratch);
     auto scratch = manager.scratch_space();
 
@@ -2176,9 +4119,8 @@ size_t Index<T, TagT, LabelT>::search_with_tags(const T *query, const uint64_t K
         diskann::cout << "Resize completed. New scratch->L is " << scratch->get_L() << std::endl;
     }
 
+    std::vector<uint32_t> init_ids = get_init_ids();
     std::shared_lock<std::shared_timed_mutex> ul(_update_lock);
-
-    const std::vector<uint32_t> init_ids = get_init_ids();
 
     //_distance->preprocess_query(query, _data_store->get_dims(),
     // scratch->aligned_query());
@@ -2191,8 +4133,39 @@ size_t Index<T, TagT, LabelT>::search_with_tags(const T *query, const uint64_t K
     else
     {
         std::vector<LabelT> filter_vec;
-        auto converted_label = this->get_converted_label(filter_label);
         filter_vec.push_back(converted_label);
+
+        std::shared_lock<std::shared_timed_mutex> tl(_tag_lock, std::defer_lock);
+        if (_dynamic_index)
+            tl.lock();
+        if (_label_to_start_id.find(converted_label) != _label_to_start_id.end())
+        {
+            init_ids.emplace_back(_label_to_start_id[converted_label]);
+        }
+        else
+        {
+            if (_dynamic_index)
+                tl.unlock();
+            throw diskann::ANNException("No filtered medoid found. exitting ", -1);
+        }
+        if (_dynamic_index)
+            tl.unlock();
+
+        if (effective_expand_num > 0 && _num_correlated_labels_to_expand > 0)
+        {
+            auto it = _label_top_correlations.find(converted_label);
+            if (it != _label_top_correlations.end())
+            {
+                const size_t take_n = std::min(static_cast<size_t>(effective_expand_num), it->second.size());
+                for (size_t i = 0; i < take_n; i++)
+                {
+                    filter_vec.emplace_back(it->second[i].second);
+                }
+                std::sort(filter_vec.begin(), filter_vec.end());
+                filter_vec.erase(std::unique(filter_vec.begin(), filter_vec.end()), filter_vec.end());
+            }
+        }
+
         iterate_to_fixed_point(scratch, L, init_ids, true, filter_vec, true);
     }
 
@@ -2209,6 +4182,15 @@ size_t Index<T, TagT, LabelT>::search_with_tags(const T *query, const uint64_t K
         TagT tag;
         if (_location_to_tag.try_get(node.id, tag))
         {
+            if (use_filters)
+            {
+                const auto &node_labels = _location_to_labels[node.id];
+                if (std::find(node_labels.begin(), node_labels.end(), converted_label) == node_labels.end())
+                {
+                    continue;
+                }
+            }
+
             tags[pos] = tag;
 
             if (res_vectors.size() > 0)
@@ -2229,6 +4211,18 @@ size_t Index<T, TagT, LabelT>::search_with_tags(const T *query, const uint64_t K
             if (pos == K || pos == res_vectors.size())
                 break;
         }
+    }
+
+    if (distances != nullptr)
+    {
+        for (size_t i = pos; i < K; i++)
+        {
+            distances[i] = std::numeric_limits<float>::infinity();
+        }
+    }
+    for (size_t i = pos; i < K; i++)
+    {
+        tags[i] = TagT{};
     }
 
     return pos;
@@ -2582,7 +4576,7 @@ template <typename T, typename TagT, typename LabelT> void Index<T, TagT, LabelT
                 assert(new_location[old] < old);
                 _graph_store->swap_neighbours(new_location[old], (location_t)old);
 
-                if (_filtered_index)
+                if (!_location_to_labels.empty())
                 {
                     _location_to_labels[new_location[old]].swap(_location_to_labels[old]);
                 }
@@ -2613,7 +4607,7 @@ template <typename T, typename TagT, typename LabelT> void Index<T, TagT, LabelT
     {
         _graph_store->clear_neighbours((location_t)old);
     }
-    if (_filtered_index)
+    if (!_location_to_labels.empty())
     {
         for (size_t old = _nd; old < _max_points; old++)
         {
@@ -2628,6 +4622,7 @@ template <typename T, typename TagT, typename LabelT> void Index<T, TagT, LabelT
         _empty_slots.insert((uint32_t)i);
     }
     _data_compacted = true;
+    rebuild_filter_inverted_index();
     diskann::cout << "Time taken for compact_data: " << timer.elapsed() / 1000000. << "s." << std::endl;
 }
 
@@ -2885,42 +4880,9 @@ int Index<T, TagT, LabelT>::insert_point(const T *point, const TagT tag, const s
     std::shared_lock<std::shared_timed_mutex> shared_ul(_update_lock);
     std::unique_lock<std::shared_timed_mutex> tl(_tag_lock);
     std::unique_lock<std::shared_timed_mutex> dl(_delete_lock);
+    bool should_flush_label_updates = false;
 
     auto location = reserve_location();
-    if (_filtered_index)
-    {
-        if (labels.empty())
-        {
-            release_location(location);
-            std::cerr << "Error: Can't insert point with tag " + get_tag_string(tag) +
-                             " . there are no labels for the point."
-                      << std::endl;
-            return -1;
-        }
-
-        _location_to_labels[location] = labels;
-
-        for (LabelT label : labels)
-        {
-            if (_labels.find(label) == _labels.end())
-            {
-                if (_frozen_pts_used >= _num_frozen_pts)
-                {
-                    throw ANNException(
-                        "Error: For dynamic filtered index, the number of frozen points should be atleast equal "
-                        "to number of unique labels.",
-                        -1);
-                }
-
-                auto fz_location = (int)(_max_points) + _frozen_pts_used; // as first _fz_point
-                _labels.insert(label);
-                _label_to_start_id[label] = (uint32_t)fz_location;
-                _location_to_labels[fz_location] = {label};
-                _data_store->set_vector((location_t)fz_location, point);
-                _frozen_pts_used++;
-            }
-        }
-    }
 
     if (location == -1)
     {
@@ -2962,6 +4924,15 @@ int Index<T, TagT, LabelT>::insert_point(const T *point, const TagT tag, const s
     } // cant insert as active pts >= max_pts
     dl.unlock();
 
+    if (_filtered_index && labels.empty())
+    {
+        release_location(location);
+        std::cerr << "Error: Can't insert point with tag " + get_tag_string(tag) +
+                         " . there are no labels for the point."
+                  << std::endl;
+        return -1;
+    }
+
     // Insert tag and mapping to location
     if (_enable_tags)
     {
@@ -2975,6 +4946,51 @@ int Index<T, TagT, LabelT>::insert_point(const T *point, const TagT tag, const s
         _tag_to_location[tag] = location;
         _location_to_tag.set(location, tag);
     }
+
+    if (!labels.empty())
+    {
+        if (_location_to_labels.size() < _max_points + _num_frozen_pts)
+        {
+            _location_to_labels.resize(_max_points + _num_frozen_pts);
+        }
+        _location_to_labels[location] = labels;
+        std::vector<LabelT> newly_seen_labels;
+        for (LabelT label : labels)
+        {
+            if (_labels.insert(label).second)
+            {
+                if (_filtered_index)
+                {
+                    if (_frozen_pts_used >= _num_frozen_pts)
+                    {
+                        throw ANNException(
+                            "Error: For dynamic filtered index, the number of frozen points should be atleast equal "
+                            "to number of unique labels.",
+                            -1);
+                    }
+                    auto fz_location = (int)(_max_points) + _frozen_pts_used;
+                    _label_to_start_id[label] = (uint32_t)fz_location;
+                    _location_to_labels[fz_location] = {label};
+                    _data_store->set_vector((location_t)fz_location, point);
+                    _frozen_pts_used++;
+                }
+                newly_seen_labels.emplace_back(label);
+            }
+        }
+        for (const auto &new_label : newly_seen_labels)
+        {
+            _pending_new_labels.insert(new_label);
+        }
+        add_location_to_filter_inverted_index(location, labels);
+    }
+
+    if (!labels.empty())
+    {
+        // 实时更新标签映射，频率/门槛/相关性等走懒批处理
+        record_insert_label_updates(location, tag, point, labels);
+        should_flush_label_updates = need_flush_pending_label_updates();
+    }
+
     tl.unlock();
 
     _data_store->set_vector(location, point); // update datastore
@@ -3019,6 +5035,17 @@ int Index<T, TagT, LabelT>::insert_point(const T *point, const TagT tag, const s
 
     inter_insert(location, pruned_list, scratch);
 
+    if (should_flush_label_updates)
+    {
+        // 中文说明：打印触发懒刷新时的现场信息，方便判断是不是刷新过于频繁。
+        diskann::cout << "[timing] trigger_flush_pending_label_updates"
+                      << " nd=" << _nd
+                      << " pending_ops=" << _pending_label_update_ops.load(std::memory_order_relaxed)
+                      << " dirty_labels=" << _dirty_labels.size() << std::endl;
+        shared_ul.unlock();
+        flush_pending_label_updates();
+    }
+
     return 0;
 }
 
@@ -3053,22 +5080,36 @@ void Index<T, TagT, LabelT>::_lazy_delete(TagVector &tags, TagVector &failed_tag
 
 template <typename T, typename TagT, typename LabelT> int Index<T, TagT, LabelT>::lazy_delete(const TagT &tag)
 {
-    std::shared_lock<std::shared_timed_mutex> ul(_update_lock);
-    std::unique_lock<std::shared_timed_mutex> tl(_tag_lock);
-    std::unique_lock<std::shared_timed_mutex> dl(_delete_lock);
-    _data_compacted = false;
-
-    if (_tag_to_location.find(tag) == _tag_to_location.end())
+    bool should_flush_label_updates = false;
     {
-        diskann::cerr << "Delete tag not found " << get_tag_string(tag) << std::endl;
-        return -1;
-    }
-    assert(_tag_to_location[tag] < _max_points);
+        std::shared_lock<std::shared_timed_mutex> ul(_update_lock);
+        std::unique_lock<std::shared_timed_mutex> tl(_tag_lock);
+        std::unique_lock<std::shared_timed_mutex> dl(_delete_lock);
+        _data_compacted = false;
 
-    const auto location = _tag_to_location[tag];
-    _delete_set->insert(location);
-    _location_to_tag.erase(location);
-    _tag_to_location.erase(tag);
+        if (_tag_to_location.find(tag) == _tag_to_location.end())
+        {
+            diskann::cerr << "Delete tag not found " << get_tag_string(tag) << std::endl;
+            return -1;
+        }
+        assert(_tag_to_location[tag] < _max_points);
+
+        const auto location = _tag_to_location[tag];
+        record_delete_label_updates(location, tag);
+        if (location < _location_to_labels.size())
+        {
+            remove_location_from_filter_inverted_index(location, _location_to_labels[location]);
+        }
+        should_flush_label_updates = need_flush_pending_label_updates();
+        _delete_set->insert(location);
+        _location_to_tag.erase(location);
+        _tag_to_location.erase(tag);
+    }
+
+    if (should_flush_label_updates)
+    {
+        flush_pending_label_updates();
+    }
     return 0;
 }
 
@@ -3079,24 +5120,38 @@ void Index<T, TagT, LabelT>::lazy_delete(const std::vector<TagT> &tags, std::vec
     {
         throw ANNException("failed_tags should be passed as an empty list", -1, __FUNCSIG__, __FILE__, __LINE__);
     }
-    std::shared_lock<std::shared_timed_mutex> ul(_update_lock);
-    std::unique_lock<std::shared_timed_mutex> tl(_tag_lock);
-    std::unique_lock<std::shared_timed_mutex> dl(_delete_lock);
-    _data_compacted = false;
-
-    for (auto tag : tags)
+    bool should_flush_label_updates = false;
     {
-        if (_tag_to_location.find(tag) == _tag_to_location.end())
+        std::shared_lock<std::shared_timed_mutex> ul(_update_lock);
+        std::unique_lock<std::shared_timed_mutex> tl(_tag_lock);
+        std::unique_lock<std::shared_timed_mutex> dl(_delete_lock);
+        _data_compacted = false;
+
+        for (auto tag : tags)
         {
-            failed_tags.push_back(tag);
+            if (_tag_to_location.find(tag) == _tag_to_location.end())
+            {
+                failed_tags.push_back(tag);
+            }
+            else
+            {
+                const auto location = _tag_to_location[tag];
+                record_delete_label_updates(location, tag);
+                if (location < _location_to_labels.size())
+                {
+                    remove_location_from_filter_inverted_index(location, _location_to_labels[location]);
+                }
+                _delete_set->insert(location);
+                _location_to_tag.erase(location);
+                _tag_to_location.erase(tag);
+            }
         }
-        else
-        {
-            const auto location = _tag_to_location[tag];
-            _delete_set->insert(location);
-            _location_to_tag.erase(location);
-            _tag_to_location.erase(tag);
-        }
+        should_flush_label_updates = need_flush_pending_label_updates();
+    }
+
+    if (should_flush_label_updates)
+    {
+        flush_pending_label_updates();
     }
 }
 
@@ -3397,41 +5452,41 @@ template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<int8_t, uint32_t,
 
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<float, uint64_t, uint32_t>::search_with_filters<
     uint64_t>(const float *query, const uint32_t &filter_label, const size_t K, const uint32_t L, uint64_t *indices,
-              float *distances);
+              float *distances, const int expand_num);
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<float, uint64_t, uint32_t>::search_with_filters<
     uint32_t>(const float *query, const uint32_t &filter_label, const size_t K, const uint32_t L, uint32_t *indices,
-              float *distances);
+              float *distances, const int expand_num);
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<uint8_t, uint64_t, uint32_t>::search_with_filters<
     uint64_t>(const uint8_t *query, const uint32_t &filter_label, const size_t K, const uint32_t L, uint64_t *indices,
-              float *distances);
+              float *distances, const int expand_num);
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<uint8_t, uint64_t, uint32_t>::search_with_filters<
     uint32_t>(const uint8_t *query, const uint32_t &filter_label, const size_t K, const uint32_t L, uint32_t *indices,
-              float *distances);
+              float *distances, const int expand_num);
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<int8_t, uint64_t, uint32_t>::search_with_filters<
     uint64_t>(const int8_t *query, const uint32_t &filter_label, const size_t K, const uint32_t L, uint64_t *indices,
-              float *distances);
+              float *distances, const int expand_num);
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<int8_t, uint64_t, uint32_t>::search_with_filters<
     uint32_t>(const int8_t *query, const uint32_t &filter_label, const size_t K, const uint32_t L, uint32_t *indices,
-              float *distances);
+              float *distances, const int expand_num);
 // TagT==uint32_t
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<float, uint32_t, uint32_t>::search_with_filters<
     uint64_t>(const float *query, const uint32_t &filter_label, const size_t K, const uint32_t L, uint64_t *indices,
-              float *distances);
+              float *distances, const int expand_num);
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<float, uint32_t, uint32_t>::search_with_filters<
     uint32_t>(const float *query, const uint32_t &filter_label, const size_t K, const uint32_t L, uint32_t *indices,
-              float *distances);
+              float *distances, const int expand_num);
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<uint8_t, uint32_t, uint32_t>::search_with_filters<
     uint64_t>(const uint8_t *query, const uint32_t &filter_label, const size_t K, const uint32_t L, uint64_t *indices,
-              float *distances);
+              float *distances, const int expand_num);
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<uint8_t, uint32_t, uint32_t>::search_with_filters<
     uint32_t>(const uint8_t *query, const uint32_t &filter_label, const size_t K, const uint32_t L, uint32_t *indices,
-              float *distances);
+              float *distances, const int expand_num);
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<int8_t, uint32_t, uint32_t>::search_with_filters<
     uint64_t>(const int8_t *query, const uint32_t &filter_label, const size_t K, const uint32_t L, uint64_t *indices,
-              float *distances);
+              float *distances, const int expand_num);
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<int8_t, uint32_t, uint32_t>::search_with_filters<
     uint32_t>(const int8_t *query, const uint32_t &filter_label, const size_t K, const uint32_t L, uint32_t *indices,
-              float *distances);
+              float *distances, const int expand_num);
 
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<float, uint64_t, uint16_t>::search<uint64_t>(
     const float *query, const size_t K, const uint32_t L, uint64_t *indices, float *distances);
@@ -3461,40 +5516,40 @@ template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<int8_t, uint32_t,
 
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<float, uint64_t, uint16_t>::search_with_filters<
     uint64_t>(const float *query, const uint16_t &filter_label, const size_t K, const uint32_t L, uint64_t *indices,
-              float *distances);
+              float *distances, const int expand_num);
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<float, uint64_t, uint16_t>::search_with_filters<
     uint32_t>(const float *query, const uint16_t &filter_label, const size_t K, const uint32_t L, uint32_t *indices,
-              float *distances);
+              float *distances, const int expand_num);
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<uint8_t, uint64_t, uint16_t>::search_with_filters<
     uint64_t>(const uint8_t *query, const uint16_t &filter_label, const size_t K, const uint32_t L, uint64_t *indices,
-              float *distances);
+              float *distances, const int expand_num);
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<uint8_t, uint64_t, uint16_t>::search_with_filters<
     uint32_t>(const uint8_t *query, const uint16_t &filter_label, const size_t K, const uint32_t L, uint32_t *indices,
-              float *distances);
+              float *distances, const int expand_num);
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<int8_t, uint64_t, uint16_t>::search_with_filters<
     uint64_t>(const int8_t *query, const uint16_t &filter_label, const size_t K, const uint32_t L, uint64_t *indices,
-              float *distances);
+              float *distances, const int expand_num);
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<int8_t, uint64_t, uint16_t>::search_with_filters<
     uint32_t>(const int8_t *query, const uint16_t &filter_label, const size_t K, const uint32_t L, uint32_t *indices,
-              float *distances);
+              float *distances, const int expand_num);
 // TagT==uint32_t
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<float, uint32_t, uint16_t>::search_with_filters<
     uint64_t>(const float *query, const uint16_t &filter_label, const size_t K, const uint32_t L, uint64_t *indices,
-              float *distances);
+              float *distances, const int expand_num);
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<float, uint32_t, uint16_t>::search_with_filters<
     uint32_t>(const float *query, const uint16_t &filter_label, const size_t K, const uint32_t L, uint32_t *indices,
-              float *distances);
+              float *distances, const int expand_num);
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<uint8_t, uint32_t, uint16_t>::search_with_filters<
     uint64_t>(const uint8_t *query, const uint16_t &filter_label, const size_t K, const uint32_t L, uint64_t *indices,
-              float *distances);
+              float *distances, const int expand_num);
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<uint8_t, uint32_t, uint16_t>::search_with_filters<
     uint32_t>(const uint8_t *query, const uint16_t &filter_label, const size_t K, const uint32_t L, uint32_t *indices,
-              float *distances);
+              float *distances, const int expand_num);
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<int8_t, uint32_t, uint16_t>::search_with_filters<
     uint64_t>(const int8_t *query, const uint16_t &filter_label, const size_t K, const uint32_t L, uint64_t *indices,
-              float *distances);
+              float *distances, const int expand_num);
 template DISKANN_DLLEXPORT std::pair<uint32_t, uint32_t> Index<int8_t, uint32_t, uint16_t>::search_with_filters<
     uint32_t>(const int8_t *query, const uint16_t &filter_label, const size_t K, const uint32_t L, uint32_t *indices,
-              float *distances);
+              float *distances, const int expand_num);
 
 } // namespace diskann
